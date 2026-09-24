@@ -60,6 +60,21 @@ interface AuxTaskCopy {
 
 export interface Translations {
   catalog: {
+    add: string
+    added: string
+    discover: string
+    featured: string
+    explorePlugins: string
+    exploreSkills: string
+    mostStarred: string
+    newest: string
+    recentlyUpdated: string
+    alphabetical: string
+    sortBy: string
+    seeAll: string
+    related: string
+    tags: string
+    screenshots: string
     listView: string
     cardView: string
     installTitle: (name: string) => string
@@ -69,7 +84,6 @@ export interface Translations {
     installing: string
     installComplete: (name: string) => string
     destinationChanged: string
-    browse: string
     installed: string
     searchSkills: string
     searchPlugins: string
@@ -84,11 +98,17 @@ export interface Translations {
     requires: string
     tools: string
     hooks: string
+    middleware: string
+    commands: string
+    license: string
+    addedDate: string
+    updatedDate: string
     repository: string
     documentation: string
     noResults: string
     tryAnother: string
     clearFilters: string
+    filters: string
     loadFailed: string
     retry: string
     more: string
