@@ -47,6 +47,15 @@ _PRUNE_DIR_MARKER_TOKENS = frozenset((
 # the segment and the boundary checks below supply the -delimiting.
 _PRUNE_TOKEN_SPLIT = re.compile(r"[._]+")
 
+_WIN_ANCHOR_RE = re.compile(r"^(?:[a-zA-Z]:[\\/]|\\\\[^\\]+)")
+
+
+def _is_win_anchor(part) -> bool:
+    """True when a Windows pure-path ``parts`` leading element is an
+    absoluteness anchor: a drive (``C:\\``, as WinDrive) or a UNC server share
+    (``\\\\server\\share``, as WinRpt). POSIX ``parts`` never look like this."""
+    return bool(_WIN_ANCHOR_RE.match(str(part)))
+
 
 def _name_segment_matches_token(seg: str, tok: str) -> bool:
     """Whole-token match on ``-`` boundaries within one dot/underscore segment."""
@@ -74,7 +83,7 @@ def is_prune_convention_dirname(name: str) -> bool:
     return False
 
 
-def is_prune_convention_path(path, *, root: Optional[Path] = None) -> bool:
+def is_prune_convention_path(path, *, root: Optional[PurePath] = None) -> bool:
     """True when any component BELOW the declared *root* carries a prune
     convention token. With no root supplied, falls back to the last
     ``skills`` anchor (see _prune_checked_parts)."""
@@ -147,7 +156,7 @@ def org_id_of_path(path, skills_dir: Path) -> Optional[str]:
     return parts[1] if len(parts) >= 2 else None
 
 
-def _prune_checked_parts(parts, root: Optional[Path] = None) -> list:
+def _prune_checked_parts(parts, root: Optional[PurePath] = None) -> list:
     """Components of a discovered path that the prune-convention rule judges.
 
     Only components BELOW the declared *root* count: the walk starts at that
@@ -160,12 +169,23 @@ def _prune_checked_parts(parts, root: Optional[Path] = None) -> list:
     when present, else the whole sequence — this keeps ancestor noise
     (a pytest tmp dir named ``test_*prune*``, a checkout under
     ``~/backups/``) from excluding a legitimate skill.
+
+    Absoluteness is FLAVOR-AWARE (est-2ek.1.789): a POSIX path is absolute on
+    a leading ``/``; a Windows path is absolute on a drive anchor (``C:\\``)
+    or a UNC anchor (``\\\\server\\share``) — ``parts`` carries those as the
+    leading element(s), never as ``/``. The tail is computed with the SAME
+    pure-path class the caller's parts came from, so drive/UNC roots subtract
+    correctly instead of leaving the whole ancestry judged.
     """
     seq = list(parts)
     if root is not None:
-        if seq and seq[0] == "/":
+        pure = (type(root)
+                if isinstance(root, PurePath) and type(root) is not PurePath
+                else PurePath)
+        absolute = bool(seq) and (seq[0] == "/" or _is_win_anchor(seq[0]))
+        if absolute:
             try:
-                seq = list(PurePath(*seq).relative_to(PurePath(str(root))).parts)
+                seq = list(pure(*seq).relative_to(pure(str(root))).parts)
             except ValueError:
                 # Path isn't under the declared root; judge it whole.
                 pass
@@ -175,7 +195,7 @@ def _prune_checked_parts(parts, root: Optional[Path] = None) -> list:
     return seq
 
 
-def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
+def is_excluded_skill_path(path, *, root: Optional[PurePath] = None) -> bool:
     """True if *path* should be skipped by skill scanners (VCS/dependency/cache
     dirs + support packages + the STRUCTURAL prune-convention rule on the
     path BELOW the declared *root* (or the last ``skills`` component when no
