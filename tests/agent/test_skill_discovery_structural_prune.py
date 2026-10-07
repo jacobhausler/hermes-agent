@@ -78,11 +78,10 @@ def test_ordinary_deep_and_support_named_skills_still_discovered(home_skills):
     assert scripts_cat in found
 
 
-def test_followlinks_default_off_and_opt_in(home_skills, tmp_path):
-    """A symlinked skill dir is skipped by default and followed only with
-    ``skills.followlinks: true`` in config.yaml."""
-    import os
-
+def test_followlinks_default_on_and_hardening_toggle(home_skills, tmp_path):
+    """Symlinked skill dirs keep resolving by default (the estate convention:
+    ``skills/<name>`` -> a checkout elsewhere), and ``skills.followlinks: false``
+    hardens the walk against symlinked subtrees."""
     outside = tmp_path / "skill-vault" / "chained-skill"
     _skill(outside, "chained-skill")
     (home_skills / "research").mkdir()
@@ -90,17 +89,30 @@ def test_followlinks_default_off_and_opt_in(home_skills, tmp_path):
     link.symlink_to(outside, target_is_directory=True)
     real = _skill(home_skills / "research" / "plain-skill", "plain-skill")
 
-    assert skill_utils.skill_discovery_followlinks() is False
+    assert skill_utils.skill_discovery_followlinks() is True
     found_default = list(iter_skill_index_files(home_skills, "SKILL.md"))
-    assert found_default == [real]
+    assert found_default == sorted([real, outside / "SKILL.md"])
 
     (tmp_path / ".hermes" / "config.yaml").write_text(
-        "skills:\n  followlinks: true\n", encoding="utf-8"
+        "skills:\n  followlinks: false\n", encoding="utf-8"
     )
     skill_utils._external_dirs_cache_clear()
-    assert skill_utils.skill_discovery_followlinks() is True
-    found_opt_in = list(iter_skill_index_files(home_skills, "SKILL.md"))
-    assert found_opt_in == sorted([real, outside / "SKILL.md"])
+    assert skill_utils.skill_discovery_followlinks() is False
+    found_hardened = list(iter_skill_index_files(home_skills, "SKILL.md"))
+    assert found_hardened == [real]
+
+
+def test_pruned_dirs_are_pruned_through_symlinks_too(home_skills, tmp_path):
+    """A symlinked subtree still passes the STRUCTURAL prune on its lexical path:
+    ``skills/probes -> vault`` must not resurrect backups parked there."""
+    vault = tmp_path / "vault"
+    _skill(vault / "referrer-cut-backup" / "pdf", "pdf")
+    link = home_skills / "probes"
+    link.symlink_to(vault, target_is_directory=True)
+    real = _skill(home_skills / "research" / "arxiv", "arxiv")
+
+    found = list(iter_skill_index_files(home_skills, "SKILL.md"))
+    assert found == [real]
 
 
 def test_manifest_and_prompt_exclude_pruned_skills(home_skills):
