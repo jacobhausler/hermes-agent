@@ -33,29 +33,53 @@ EXCLUDED_SKILL_DIRS = frozenset((
 # depth, wherever it sits under a skills root. The name denylist above stays
 # as the second line; this rule is the first, so backups the owner moved
 # under a convention dir cannot re-materialize as index entries the way four
-# cut skills nearly did when the denylist missed 'probes'. Token match is on
-# ``[._-]``-delimited segments, so "shortcut" or "cutout" never fire.
+# cut skills nearly did when the denylist missed 'probes'. A token must
+# match whole, on -delimited boundaries, so "shortcut" or "cutout" never
+# fire; tokens may themselves be compound (``pre-fold``).
 _PRUNE_DIR_MARKER_TOKENS = frozenset((
     "probes", "backup", "backups", "cut", "grave", "graves",
     "prune", "pruned", "pre-fold", "quarantine", "archive",
 ))
-_PRUNE_TOKEN_SPLIT = re.compile(r"[._-]+")
+# Segment the NAME on dot/underscore boundaries; a token then matches a
+# segment (or a hyphen-bounded window inside one). A single ``[._-]+``
+# split shredded the compound marker ``pre-fold`` into ``pre``+``fold``
+# and made it unmatchable (est-2ek.1.788), so the split keeps hyphens in
+# the segment and the boundary checks below supply the -delimiting.
+_PRUNE_TOKEN_SPLIT = re.compile(r"[._]+")
+
+
+def _name_segment_matches_token(seg: str, tok: str) -> bool:
+    """Whole-token match on ``-`` boundaries within one dot/underscore segment."""
+    return (seg == tok
+            or seg.startswith(tok + "-")
+            or seg.endswith("-" + tok)
+            or ("-" + tok + "-") in seg)
 
 
 def is_prune_convention_dirname(name: str) -> bool:
     """True when a directory NAME carries a prune convention token.
 
-    Matches whole ``[._-]``-delimited tokens (case-insensitive), never
-    substrings: ``referrer-cut-backup``, ``claude-design.pre-fold-1790`` and
-    ``.grave`` fire; ``shortcut``, ``layout-cutout``, ``gradegrinder`` do not.
+    Matches whole delimited tokens (case-insensitive), never substrings:
+    the name is segmented on ``[._]`` and a token may match a whole segment
+    or a ``-``-delimited window inside one, so ``referrer-cut-backup``,
+    the compound ``claude-design.pre-fold-1790`` and ``.grave`` fire;
+    ``shortcut``, ``layout-cutout``, ``gradegrinder`` do not.
     """
-    return any(tok in _PRUNE_DIR_MARKER_TOKENS
-               for tok in _PRUNE_TOKEN_SPLIT.split(name.lower()) if tok)
+    for seg in _PRUNE_TOKEN_SPLIT.split(name.lower()):
+        if not seg:
+            continue
+        if any(_name_segment_matches_token(seg, tok)
+               for tok in _PRUNE_DIR_MARKER_TOKENS):
+            return True
+    return False
 
 
-def is_prune_convention_path(path) -> bool:
-    """True when ANY path component carries a prune convention token."""
-    return any(is_prune_convention_dirname(part) for part in PurePath(str(path)).parts)
+def is_prune_convention_path(path, *, root: Optional[Path] = None) -> bool:
+    """True when any component BELOW the declared *root* carries a prune
+    convention token. With no root supplied, falls back to the last
+    ``skills`` anchor (see _prune_checked_parts)."""
+    return any(is_prune_convention_dirname(part)
+               for part in _prune_checked_parts(PurePath(str(path)).parts, root))
 
 
 def skill_discovery_followlinks() -> bool:
@@ -123,18 +147,29 @@ def org_id_of_path(path, skills_dir: Path) -> Optional[str]:
     return parts[1] if len(parts) >= 2 else None
 
 
-def _prune_checked_parts(parts) -> list:
+def _prune_checked_parts(parts, root: Optional[Path] = None) -> list:
     """Components of a discovered path that the prune-convention rule judges.
 
-    Only components BELOW a skills root count: the walk starts at a declared
+    Only components BELOW the declared *root* count: the walk starts at that
     root, so its relative path — not its absolute ancestry — is the discovery
-    shape. Anchor on the last ``skills`` component when present; when the
-    path carries no such component (an external root named anything), judge
-    the whole relative tail conservatively. This keeps ancestor noise
+    shape (est-2ek.1.789). When *root* is supplied and the path is absolute,
+    judge its tail relative to the root (an external root sitting under
+    ``~/backups/`` keeps its legitimate skills); a root-relative caller form
+    is already the discovery shape and is judged whole. When the path carries
+    no such anchor (no root given), fall back to the last ``skills`` component
+    when present, else the whole sequence — this keeps ancestor noise
     (a pytest tmp dir named ``test_*prune*``, a checkout under
     ``~/backups/``) from excluding a legitimate skill.
     """
     seq = list(parts)
+    if root is not None:
+        if seq and seq[0] == "/":
+            try:
+                seq = list(PurePath(*seq).relative_to(PurePath(str(root))).parts)
+            except ValueError:
+                # Path isn't under the declared root; judge it whole.
+                pass
+        return seq
     if "skills" in seq:
         return seq[len(seq) - 1 - seq[::-1].index("skills") + 1:]
     return seq
@@ -143,13 +178,14 @@ def _prune_checked_parts(parts) -> list:
 def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
     """True if *path* should be skipped by skill scanners (VCS/dependency/cache
     dirs + support packages + the STRUCTURAL prune-convention rule on the
-    path BELOW a skills root — backups parked under probes/, *.backup-*,
+    path BELOW the declared *root* (or the last ``skills`` component when no
+    root is supplied) — backups parked under probes/, *.backup-*,
     .grave/ etc. are excluded at any depth). Apply to every SKILL.md from a
-    direct ``rglob``."""
-    parts = PurePath(str(path)).parts
-    return (any(part in EXCLUDED_SKILL_DIRS for part in parts)
+    direct ``rglob``; pass ``root=`` whenever you have the real declared root
+    so walker and filter agree (see _prune_checked_parts)."""
+    return (any(part in EXCLUDED_SKILL_DIRS for part in PurePath(str(path)).parts)
             or is_skill_support_path(path, root=root)
-            or any(is_prune_convention_dirname(part) for part in _prune_checked_parts(parts)))
+            or is_prune_convention_path(path, root=root))
 
 
 def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
