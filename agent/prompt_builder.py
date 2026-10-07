@@ -22,9 +22,10 @@ from hermes_constants import (
 from agent.model_metadata import CHARS_PER_TOKEN
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
-    EXCLUDED_SKILL_DIRS, ORG_ACTIVE_MARKER, ORG_MIRROR_DIR_NAME, ORG_PROVENANCE_FILE, SKILL_SUPPORT_DIRS,
-    extract_skill_conditions, extract_skill_description, get_all_skills_dirs, get_disabled_skill_names,
-    iter_skill_index_files, parse_frontmatter, read_active_org_id, skill_matches_apps, skill_matches_environment,
+    ORG_ACTIVE_MARKER, ORG_MIRROR_DIR_NAME, ORG_PROVENANCE_FILE,
+    _prune_walk_dirs, extract_skill_conditions, extract_skill_description, get_all_skills_dirs,
+    get_disabled_skill_names, iter_skill_index_files, parse_frontmatter, read_active_org_id,
+    skill_discovery_followlinks, skill_matches_apps, skill_matches_environment,
     skill_matches_platform, skill_matches_platform_list,
 )
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
@@ -1119,7 +1120,9 @@ _SKILLS_PROMPT_CACHE_MAX = 32
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 # v2 added org provenance fields (org_id/org_author); older snapshots are rebuilt.
-_SKILLS_SNAPSHOT_VERSION = 3
+# v4 carries the manifest produced by the STRUCTURAL prune walkers (est-2ek.1.381):
+# v3 snapshots were keyed with the old name-denylist walk and must not be trusted.
+_SKILLS_SNAPSHOT_VERSION = 4
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1150,13 +1153,13 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
         manifest[ORG_MIRROR_DIR_NAME + "/" + ORG_ACTIVE_MARKER] = list(file_signature(st))
     except OSError:
         pass
-    for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+    for root, dirs, files in os.walk(skills_dir_str, followlinks=skill_discovery_followlinks()):
         has_skill_md = "SKILL.md" in files
         if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
             dirs.remove(ORG_MIRROR_DIR_NAME)
         elif root == org_root:
             dirs[:] = [d for d in dirs if d == active_org]
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
+        _prune_walk_dirs(dirs, has_skill_md)
         for filename in ("SKILL.md", "DESCRIPTION.md"):
             path = os.path.join(root, filename)
             try:

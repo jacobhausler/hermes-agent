@@ -91,7 +91,8 @@ def test_followlinks_default_on_and_hardening_toggle(home_skills, tmp_path):
 
     assert skill_utils.skill_discovery_followlinks() is True
     found_default = list(iter_skill_index_files(home_skills, "SKILL.md"))
-    assert found_default == sorted([real, outside / "SKILL.md"])
+    # The walker yields the LEXICAL path under the root, not the resolved target.
+    assert found_default == sorted([real, link / "SKILL.md"])
 
     (tmp_path / ".hermes" / "config.yaml").write_text(
         "skills:\n  followlinks: false\n", encoding="utf-8"
