@@ -75,8 +75,7 @@ def test_ordinary_deep_and_support_named_skills_still_discovered(home_skills):
     """Deep categories and support-named categories keep working (walk preserved)."""
     deep = _skill(home_skills / "research" / "nested" / "deep-skill", "deep-skill")
     scripts_cat = _skill(home_skills / "scripts" / "bash-helper", "bash-helper")
-    # A category literally named 'backups' (plural, no marker boundary match on a
-    # skill-name-shaped word) — only the prune CONVENTION words bite.
+    # Only whole delimiter-bounded convention TOKENS bite, never substrings.
     found = list(iter_skill_index_files(home_skills, "SKILL.md"))
     assert deep in found
     assert scripts_cat in found
@@ -147,3 +146,103 @@ def test_snapshot_version_bumped_for_structural_manifest():
     from agent import prompt_builder as pb
 
     assert pb._SKILLS_SNAPSHOT_VERSION >= 4
+
+
+def test_standalone_compound_pre_fold_pruned_everywhere(home_skills):
+    """est-2ek.1.788: a STANDALONE compound marker dir — e.g.
+    ``creative/claude-design.pre-fold-1790944314`` with no other excluded
+    ancestor — must be pruned by the walkers, the manifest, the rendered
+    prompt AND the direct filter. The committed manifest test hid this case
+    under probes/, which is independently pruned, and the whole-name check
+    never yielded the token ``pre-fold`` from the [._-]-split."""
+    from agent import prompt_builder as pb
+
+    zombie = _skill(
+        home_skills / "creative" / "claude-design.pre-fold-1790944314", "fold-zombie"
+    )
+    real = _skill(home_skills / "research" / "arxiv", "arxiv")
+
+    assert skill_utils.is_prune_convention_dirname("claude-design.pre-fold-1790944314") is True
+
+    found = list(iter_skill_index_files(home_skills, "SKILL.md"))
+    assert zombie not in found
+    assert found == [real]
+
+    pb.clear_skills_system_prompt_cache(clear_snapshot=True)
+    try:
+        manifest = pb._build_skills_manifest(home_skills)
+        assert not any("pre-fold" in k for k in manifest), manifest.keys()
+
+        rendered = pb._build_skills_system_prompt_inner(home_skills, [], None, None, None)
+        assert "fold-zombie" not in rendered
+        assert "arxiv" in rendered
+    finally:
+        pb.clear_skills_system_prompt_cache(clear_snapshot=True)
+
+    assert is_excluded_skill_path(zombie, root=home_skills) is True
+    assert is_excluded_skill_path(zombie) is True
+
+
+def test_safe_substring_dirnames_stay_discovered(home_skills):
+    """est-2ek.1.788 counterweight: a denylist token must match a whole
+    [._-]-delimited TOKEN of the name; substrings inside a token do not
+    prune (``layout-cutout`` tokenizes to ['layout','cutout'] and neither
+    token equals ``cut``)."""
+    assert skill_utils.is_prune_convention_dirname("layout-cutout") is False
+    assert skill_utils.is_prune_convention_dirname("shortcut") is False
+
+    safe = _skill(home_skills / "creative" / "layout-cutout", "layout-cutout")
+    also = _skill(home_skills / "productivity" / "shortcut-guide", "shortcut-guide")
+
+    found = list(iter_skill_index_files(home_skills, "SKILL.md"))
+    assert safe in found and also in found
+    assert is_excluded_skill_path(safe, root=home_skills) is False
+
+
+def test_nested_skills_dir_below_root_pruned_by_walker_and_filter(home_skills):
+    """est-2ek.1.789(a): ``skills/probes/skills/nested-zombie`` — the walker
+    pruned it but the direct filter's last-``skills``-component anchor let a
+    nested category reset the prune boundary. The two discovery paths must
+    agree: pruned by BOTH."""
+    nested = _skill(home_skills / "probes" / "skills" / "nested-zombie", "nested-zombie")
+    real = _skill(home_skills / "research" / "arxiv", "arxiv")
+
+    found = list(iter_skill_index_files(home_skills, "SKILL.md"))
+    assert nested not in found
+    assert found == [real]
+
+    assert is_excluded_skill_path(nested, root=home_skills) is True
+    # Root-relative caller form must agree with the absolute form.
+    assert is_excluded_skill_path(nested.relative_to(home_skills), root=home_skills) is True
+
+
+def test_external_root_below_prune_named_ancestory_is_discovered(home_skills, tmp_path):
+    """est-2ek.1.789(b): with an EXTERNAL root at ``<tmp>/backups/external-corpus``
+    the walker finds ``research/legitimate/SKILL.md`` and the direct filter
+    must NOT reject it — the prune judges components RELATIVE to the supplied
+    root, so a ``backups`` token ABOVE the root is ancestor noise, not a
+    discovery shape. (Branch-induced regression vs base d188a47e.)"""
+    external_root = tmp_path / "backups" / "external-corpus"
+    legit = _skill(external_root / "research" / "legitimate", "legitimate")
+
+    found = list(iter_skill_index_files(external_root, "SKILL.md"))
+    assert legit in found
+
+    # Absolute and root-relative caller forms both pass the filter.
+    assert is_excluded_skill_path(legit, root=external_root) is False
+    assert is_excluded_skill_path(legit.relative_to(external_root), root=external_root) is False
+
+
+def test_prune_tokens_below_root_still_reject_direct_filter(home_skills, tmp_path):
+    """est-2ek.1.789: root-relative judgment cuts BOTH ways — tokens BELOW
+    the supplied root do prune, whatever the absolute ancestry above it says."""
+    external_root = tmp_path / "backups" / "external-corpus"
+    zombie = _skill(external_root / "probes" / "referrer-cut-backup" / "pdf", "pdf")
+    real = _skill(external_root / "research" / "legitimate", "legitimate")
+
+    found = list(iter_skill_index_files(external_root, "SKILL.md"))
+    assert zombie not in found
+    assert found == [real]
+
+    assert is_excluded_skill_path(zombie, root=external_root) is True
+    assert is_excluded_skill_path(zombie.relative_to(external_root), root=external_root) is True
