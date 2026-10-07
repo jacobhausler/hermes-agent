@@ -5,9 +5,13 @@ agent.prompt_builder._build_skills_manifest) must never materialize a
 directory that follows a prune convention (probes/, *.backup-*, .archive/,
 .grave/, cut backups) as a skill — at any depth — regardless of what a
 name-based denylist covers. EXCLUDED_SKILL_DIRS stays as the second line;
-the structural rule is the first. Symlinked skill dirs keep working, but
-following directory symlinks during the walk is now an explicit opt-in
-(``skills.followlinks: true``), off by default.
+the structural rule is the first. Symlinked skill dirs keep working
+(``skills/haus-docs`` -> a checkout is a supported, live estate convention —
+a no-followlinks blast check shows 521 SKILL.md dirs resolve only through
+links), and following directory symlinks is now an explicit operator toggle
+(``skills.followlinks``); it defaults to on for that compatibility and a
+test pins both the default and the hardening flip. Prune judgment is lexical,
+so a ``skills/probes`` -> vault symlink cannot smuggle backups back in.
 
 Red reproduction for the estate incident: the owner cut 4 skills and parked
 the backups under ``skills/probes/referrer-cut-backup/``; the name denylist
