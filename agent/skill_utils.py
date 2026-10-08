@@ -107,12 +107,33 @@ def skill_discovery_followlinks() -> bool:
 def _prune_walk_dirs(dirs: list, has_skill_md: bool) -> None:
     """In-place dir filter shared by every skill discovery walker: name
     denylist + per-skill support dirs + the STRUCTURAL prune convention."""
-    dirs[:] = [
+    dirs[:] = sorted(
         d for d in dirs
         if d not in EXCLUDED_SKILL_DIRS
         and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
         and not is_prune_convention_dirname(d)
-    ]
+    )
+
+
+def _skip_walk_root(root: str, real_skills_dir: str, visited: set, dirs: list) -> bool:
+    """True when a discovery walker must neither read nor descend into *root*
+    (est-2ek.1.309). Clears *dirs* in place when it returns True.
+
+    * A real directory is walked once: a second symlink to it is skipped, so
+      lexical order decides which path serves the skill.
+    * A directory that contains ``.git`` (dir or worktree file) is a working
+      checkout, whose uncommitted SKILL.md edits have had no review: it is
+      skipped. The skills root itself is exempt (the skills house is a repo).
+    """
+    real_root = os.path.realpath(root)
+    if real_root in visited:
+        dirs[:] = []
+        return True
+    visited.add(real_root)
+    if real_root != real_skills_dir and os.path.lexists(os.path.join(real_root, ".git")):
+        dirs[:] = []
+        return True
+    return False
 
 # Progressive-disclosure support dirs inside a skill package: loaded explicitly
 # via skill_view(skill, file_path=...), never scanned as standalone skills.
@@ -924,7 +945,10 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     active_org = read_active_org_id(skills_dir)
     org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
     matches: list[str] = []
+    real_skills_dir, visited = os.path.realpath(skills_dir_str), set()
     for root, dirs, files in os.walk(skills_dir_str, followlinks=skill_discovery_followlinks()):
+        if _skip_walk_root(root, real_skills_dir, visited, dirs):
+            continue
         has_skill_md = "SKILL.md" in files
         if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
             dirs.remove(ORG_MIRROR_DIR_NAME)

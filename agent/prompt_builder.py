@@ -23,7 +23,7 @@ from agent.model_metadata import CHARS_PER_TOKEN
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
     ORG_ACTIVE_MARKER, ORG_MIRROR_DIR_NAME, ORG_PROVENANCE_FILE,
-    _prune_walk_dirs, extract_skill_conditions, extract_skill_description, get_all_skills_dirs,
+    _prune_walk_dirs, _skip_walk_root, extract_skill_conditions, extract_skill_description, get_all_skills_dirs,
     get_disabled_skill_names, iter_skill_index_files, parse_frontmatter, read_active_org_id,
     skill_discovery_followlinks, skill_matches_apps, skill_matches_environment,
     skill_matches_platform, skill_matches_platform_list,
@@ -1153,7 +1153,10 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
         manifest[ORG_MIRROR_DIR_NAME + "/" + ORG_ACTIVE_MARKER] = list(file_signature(st))
     except OSError:
         pass
+    real_skills_dir, visited = os.path.realpath(skills_dir_str), set()
     for root, dirs, files in os.walk(skills_dir_str, followlinks=skill_discovery_followlinks()):
+        if _skip_walk_root(root, real_skills_dir, visited, dirs):
+            continue
         has_skill_md = "SKILL.md" in files
         if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
             dirs.remove(ORG_MIRROR_DIR_NAME)
