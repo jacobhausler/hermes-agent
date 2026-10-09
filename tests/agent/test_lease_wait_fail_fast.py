@@ -299,6 +299,27 @@ def test_db_without_diagnostic_method_still_admits():
     assert db.kwargs["wait_seconds"] == LEASE_WAIT_SECONDS
 
 
+def test_interrupt_branch_keeps_its_own_log_and_no_false_timeout_line(caplog):
+    db = _WaitDB(row=(_foreign_holder(), time.time() - 60.0, time.time() + 240.0), acquire_result=False)
+    with caplog.at_level(logging.INFO, logger="run_agent"):
+        _admit(_agent(db, interrupted=True), db)
+    assert "aborted by interrupt" in caplog.text
+    assert "wait timed out" not in caplog.text  # never claims a timeout that did not happen
+
+
+def test_timeout_log_prefix_survives_a_readerless_db(caplog):
+    """Main's exact error line must still be emitted when the row is unreadable (shim DB):
+    the holder facts are a suffix, never a replacement for the pre-existing log."""
+
+    class _NoReaderDB(_WaitDB):
+        get_session_turn_lease = None  # type: ignore[assignment]  # hides the method: callable(getattr(...)) is False
+
+    db = _NoReaderDB(acquire_result=False)
+    with caplog.at_level(logging.ERROR, logger="run_agent"):
+        _admit(_agent(db), db)
+    assert "session turn lease wait timed out for sess-lease" in caplog.text
+
+
 # ------------------------------------------- the diagnostic read itself (real DB)
 
 

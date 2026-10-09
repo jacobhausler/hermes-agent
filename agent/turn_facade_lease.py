@@ -383,9 +383,14 @@ def admit_durable_turn_lease(
         should_abort=lambda: getattr(agent, "_interrupt_requested", False),
     ):
         # Name the holder that kept the row (read AFTER the wait, so it is the holder that
-        # actually timed us out) — pure diagnostics: nothing decides on this read.
-        _log_session_turn_lease_timeout_holder(db, session_id, holder)
-        admission.early_result = _lease_not_acquired_result(agent, session_id, conversation_history)
+        # actually timed us out) — pure diagnostics: nothing decides on this read. Only the
+        # give-up path: an interrupted wait logs its own info line, as before.
+        holder_diag = ""
+        if not getattr(agent, "_interrupt_requested", False):
+            holder_diag = _session_turn_lease_holder_diag(db, session_id, holder)
+        admission.early_result = _lease_not_acquired_result(
+            agent, session_id, conversation_history, holder_diag=holder_diag,
+        )
         return admission
 
     # Assign only after admission so the finally cannot release a holder that never owned the
@@ -475,17 +480,18 @@ def carry_unadmitted_user_message(
     append_message(early_result["messages"], deferred_user, timestamp=timestamp)
 
 
-def _log_session_turn_lease_timeout_holder(db, session_id: str, holder: str) -> None:
-    """Name the holder that kept the row after a lease-wait timeout: pid, pidns stamp,
-    platform and since-time at the one error log the operator reads. Read AFTER the
-    wait, so it names the holder that actually timed us out, not one that came and
+def _session_turn_lease_holder_diag(db, session_id: str, holder: str) -> str:
+    """Suffix naming the holder that kept the row after a lease-wait timeout: pid, pidns
+    stamp, platform and since-time — for the one timeout error log the operator reads. Read
+    AFTER the wait, so it names the holder that actually timed us out, not one that came and
     went. Pure diagnostics: nothing decides on this read (same posture as
-    ``get_compression_lock_holder``), and a shim DB may lack the reader entirely."""
+    ``get_compression_lock_holder``), and a shim DB may lack the reader entirely — then this
+    returns "" and the log line stays exactly what it has always been."""
     try:
         reader = getattr(db, "get_session_turn_lease", None)
         row = reader(session_id) if callable(reader) else None
         if not isinstance(row, (tuple, list)) or len(row) < 2 or row[0] == holder:
-            return
+            return ""
         from datetime import datetime, timezone
 
         from hermes_state_pidns import holder_pid_checkable, recorded_namespace
@@ -502,17 +508,18 @@ def _log_session_turn_lease_timeout_holder(db, session_id: str, holder: str) -> 
             ns = recorded_namespace(foreign_holder)
             # The reclaim probe defers this row to its expiry: hermes_state_pidns.
             probe = f"unprovable from this PID namespace ({'pidns=' + str(ns) if ns else 'unstamped(pre-upgrade)'})"
-        logger.error(
-            "session turn lease wait timed out for %s; held by %r (%s, since %s) — configure "
-            "agent.turn_lease.wait_seconds to tune the admission wait",
-            session_id, foreign_holder, probe, since,
+        return (
+            f"; held by {foreign_holder!r} ({probe}, since {since}) — configure "
+            "agent.turn_lease.wait_seconds to tune the admission wait"
         )
     except Exception:  # health: allow BLE001 -- pure diagnostics: a shim DB may raise anything and must never fail the turn
         logger.debug("session turn lease holder diagnostics failed", exc_info=True)
-        logger.error("session turn lease wait timed out for %s", session_id)
+        return ""
 
 
-def _lease_not_acquired_result(agent, session_id: str, conversation_history) -> dict[str, Any]:
+def _lease_not_acquired_result(
+    agent, session_id: str, conversation_history, *, holder_diag: str = "",
+) -> dict[str, Any]:
     base = {"messages": list(conversation_history or []), "api_calls": 0, "completed": False}
     if getattr(agent, "_interrupt_requested", False):
         logger.info("session turn lease wait aborted by interrupt: %s", session_id)
@@ -545,6 +552,8 @@ def _lease_not_acquired_result(agent, session_id: str, conversation_history) -> 
         "⏳ Another Hermes process kept this session busy too long. Your message was not "
         "processed - wait for the other process to finish, then send it again."
     )
+    # Same error line as before the knob; when the row is readable it names the holder.
+    logger.error("session turn lease wait timed out for %s%s", session_id, holder_diag)
     try:
         agent._emit_warning(timeout_msg)
     except Exception:
