@@ -22,7 +22,7 @@ from hermes_constants import (
 from agent.model_metadata import CHARS_PER_TOKEN
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
-    TIER_LOCAL, _prune_walk_dirs,
+    TIER_LOCAL, _prune_walk_dirs, _skip_walk_root,
     extract_skill_conditions, extract_skill_description, get_disabled_skill_names, get_skill_search_roots,
     iter_skill_index_files, parse_frontmatter, skill_discovery_followlinks, skill_matches_apps, skill_matches_environment,
     skill_matches_platform, skill_matches_platform_list,
@@ -1231,7 +1231,10 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     manifest: dict[str, list[int]] = {}
     skills_dir_str = str(skills_dir)
     prefix_len = len(os.path.join(skills_dir_str, ""))
+    real_skills_dir, visited = os.path.realpath(skills_dir_str), set()
     for root, dirs, files in os.walk(skills_dir_str, followlinks=skill_discovery_followlinks()):
+        if _skip_walk_root(root, real_skills_dir, visited, dirs):
+            continue
         has_skill_md = "SKILL.md" in files
         _prune_walk_dirs(dirs, has_skill_md)
         for filename in ("SKILL.md", "DESCRIPTION.md"):
