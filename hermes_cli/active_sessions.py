@@ -12,6 +12,7 @@ import logging
 import collections
 import math
 import os
+import sys
 import time
 import uuid
 from contextlib import contextmanager, suppress
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home, named_profile_is_live
+from hermes_state_pidns import pid_namespace_id, persistent_record_pidns_checkable
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -137,11 +139,16 @@ def format_refusal_stderr(message: str) -> str:
 def _is_same_writer(entry: dict[str, Any], metadata: Optional[dict[str, Any]]) -> bool:
     """True when an existing lease belongs to the very caller re-acquiring it.
     Identity is (pid, live_session_id): pid alone lets two live sessions in one process
-    steal each other's lease; the live id alone lets another process with an equal id."""
+    steal each other's lease; the live id alone lets another process with an equal id.
+    A foreign PID-namespace stamp vetoes even a pid match: sibling containers reuse
+    pids independently, so equal pid + equal live id across namespaces is two writers,
+    not one."""
     try:
         if int(entry.get("pid") or -1) != os.getpid():
             return False
     except (TypeError, ValueError):
+        return False
+    if _foreign_stamped(entry):
         return False
     existing_live = str((entry.get("metadata") or {}).get("live_session_id") or "")
     incoming_live = str((metadata or {}).get("live_session_id") or "")
@@ -153,7 +160,13 @@ def session_owner_details(session_id: str, entry: dict[str, Any]) -> str:
     surface = str(entry.get("surface") or "another surface")
     started = _optional_float(entry.get("started_at"))
     age = f" {format_age(time.time() - started)} ago" if started else ""
-    return f"Details: session {session_id} opened by {surface}{age}."
+    origin = ""
+    if _foreign_stamped(entry):
+        # Name the un-observable owner precisely: the operator must be able to
+        # tell a live sibling container from a local window without guessing.
+        origin = (f" in PID namespace {_entry_pidns(entry)} (not this container;"
+                 f" pid {entry.get('pid')} there, liveness proven by its lease witness)")
+    return f"Details: session {session_id} opened by {surface}{age}{origin}."
 
 
 def session_already_owned_message(session_id: str, entry: dict[str, Any]) -> str:
@@ -224,6 +237,125 @@ class _FileLock:
             fh.close()
 
 
+# ---------------------------------------------------------------------------
+# Lease liveness witness (PID-namespace-safe owner liveness)
+#
+# A bare pid cannot prove liveness across PID namespaces, and a JSON row has no
+# kernel object behind it — unlike the state.db flock records, whose foreign
+# holders are safe to defer there precisely because the kernel lock itself is
+# the cross-namespace oracle (see hermes_state_pidns). So a stamped entry names
+# a witness file this module's owner keeps flocked(LOCK_EX) for the lease's
+# lifetime: flock lives on the open file description, so it is namespace-blind —
+# EWOULDBLOCK for a LOCK_SH|LOCK_NB probe means the owner is alive ANYWHERE on
+# this mount, and acquiring it means the holder is gone (kernel auto-releases on
+# process death, including SIGKILL and container teardown). That makes a crashed
+# sibling's rows reclaimable instead of immortal (no TTL on registry rows), and
+# an unreadable witness stays unknowable — fail-closed for exclusivity, matching
+# the owner-liveness-unknown posture. Off Linux no stamp is ever written, so no
+# witness is ever created; entries written without a held witness stay unstamped
+# (legacy probe) rather than being born unreclaimable.
+# ---------------------------------------------------------------------------
+
+_LEASE_WITNESS_VERSION = "leases-v1"
+_WITNESSES: dict[tuple[str, str], tuple[Any, Path]] = {}  # (state_path, lease_id) -> (fh, path)
+_warned_no_stamp = False
+
+
+def _entry_pidns(entry: dict[str, Any]) -> Optional[str]:
+    """Normalized PID-namespace stamp: the stripped inode string, or None when the
+    entry carries no usable stamp (missing/blank/non-str → legacy unstamped)."""
+    value = entry.get("pidns")
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _witness_dir(state_path: Path) -> Path:
+    return state_path.parent / "leases"
+
+
+def _witness_path_for(state_path: Path, lease_id: str) -> Path:
+    return _witness_dir(state_path) / f"{lease_id}.lock"
+
+
+def _hold_witness(state_path: Path, lease_id: str) -> bool:
+    """Make this process the kernel-visible holder of ``lease_id``'s witness.
+
+    Returns True while this process holds LOCK_EX on the witness (idempotent).
+    False means the witness could not be taken — callers must then NOT stamp,
+    keeping the entry on the legacy pid probe instead of a stamp no one can
+    resolve after a crash.
+    """
+    if os.name == "nt":
+        return False  # stamping never happens there; witness is a POSIX concept
+    key = (str(state_path), str(lease_id))
+    if key in _WITNESSES:
+        return True
+    try:
+        import fcntl
+
+        directory = _witness_dir(state_path)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{lease_id}.lock"
+        fh = open(path, "a+b")
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+        _WITNESSES[key] = (fh, path)
+        return True
+    except Exception:
+        return False
+
+
+def _drop_witness(state_path: Path, lease_id: str) -> None:
+    """Release and unlink a witness this process held (best-effort)."""
+    entry = _WITNESSES.pop((str(state_path), str(lease_id)), None)
+    if entry is None:
+        return
+    fh, path = entry
+    with suppress(Exception):
+        fh.close()  # closing the fd releases the flock
+    with suppress(OSError):
+        path.unlink(missing_ok=True)
+
+
+def _witness_liveness(entry: dict[str, Any], state_path: Path) -> Optional[bool]:
+    """Kernel-level liveness for a foreign-stamped row: True live / False dead /
+    None unknowable. Only meaningful for rows that name a witness version;
+    pre-witness stamped rows (and anything unresolvable) stay unknowable so a
+    half-upgraded registry is never wrongly pruned.
+    """
+    if os.name == "nt":
+        return None
+    if entry.get("lease_witness") != _LEASE_WITNESS_VERSION:
+        return None
+    lease_id = str(entry.get("lease_id") or "")
+    if not lease_id:
+        return None
+    try:
+        import fcntl
+
+        path = _witness_path_for(state_path, lease_id)
+        fh = open(path, "a+b")
+    except Exception:
+        return None  # witness unreadable: unknowable, keep the row (fail-closed)
+    try:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True  # someone holds it: the owner is alive, in some namespace
+        except OSError:
+            return None
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        return False  # acquired the witness: its holder is gone (kernel auto-release)
+    finally:
+        with suppress(Exception):
+            fh.close()
+
+
 def _read_entries(path: Path, *, strict: bool = False) -> list[dict[str, Any]]:
     def invalid(what: str) -> ActiveSessionRegistryError:
         return ActiveSessionRegistryError(f"active session registry {what}: {path}")
@@ -262,6 +394,8 @@ def _read_entries(path: Path, *, strict: bool = False) -> list[dict[str, Any]]:
             (lambda: not _optional_isinstance(entry.get("track_liveness"), bool), "an invalid liveness marker"),
             (lambda: not _optional_isinstance(entry.get("metadata"), dict), "invalid metadata"),
             (lambda: not _valid_process_start(entry.get("process_start_time")), "an invalid process start time"),
+            (lambda: not _valid_pidns(entry.get("pidns")), "an invalid pid namespace"),
+            (lambda: not _valid_witness(entry.get("lease_witness")), "an invalid lease witness"),
         ):
             if bad():
                 raise invalid(f"contains {what}")
@@ -292,6 +426,23 @@ def _valid_process_start(v: Any) -> bool:
         return True
     parsed = _optional_float(v)
     return parsed is not None and math.isfinite(parsed)
+
+
+def _valid_pidns(v: Any) -> bool:
+    """Strict schema: the pidns stamp is absent or a non-blank digits-only string.
+
+    Anything else ({}, True, an int, "x") would be normalized to unstamped on
+    read while a writer could have meant it as a real foreign stamp — silently
+    re-exposing the cross-namespace prune bug. Reject it loudly instead (the
+    registry fails closed with SESSION_COORDINATION_UNAVAILABLE)."""
+    if v is None:
+        return True
+    return isinstance(v, str) and bool(v.strip()) and v.strip().isdigit()
+
+
+def _valid_witness(v: Any) -> bool:
+    """Strict schema: the witness token is absent or the one known version."""
+    return v is None or v == _LEASE_WITNESS_VERSION
 
 
 def _write_entries(path: Path, entries: list[dict[str, Any]]) -> None:
@@ -332,10 +483,32 @@ def _optional_float(value: Any) -> Optional[float]:
         return None
 
 
-def _pid_liveness(pid: Any, process_start_time: Any = None, *, lenient: bool = False) -> Optional[bool]:
-    """True/False for live/dead, or None when unknowable. ``lenient`` never returns None:
-    an unparseable pid or failed existence probe counts as dead, an unreadable start as alive."""
+def _pid_liveness(
+    pid: Any, process_start_time: Any = None, *, pidns: Any = None, lenient: bool = False
+) -> Optional[bool]:
+    """True/False for live/dead, or None when unknowable. ``lenient`` degrades an
+    unparseable pid or failed existence probe to dead and an unreadable start to
+    alive — the one exception is a foreign-PID-namespace stamp, which stays None
+    even under ``lenient`` (see below; ``_prune_dead`` resolves those via the
+    witness, never by degrading to dead).
+
+    ``pidns`` is the entry's PID-namespace stamp. A pid is only evidence INSIDE the
+    namespace that recorded it: two containers sharing one HERMES_HOME see each
+    other's live processes as absent and prune each other's entries.
+    A foreign-stamped entry is therefore unknowable from the pid alone — even under
+    ``lenient``: degrading it to dead is exactly the wrong-the-container prune this
+    gate exists to stop. Callers resolve foreign rows with
+    :func:`_witness_liveness`, the kernel-level check that works across namespaces.
+    Unstamped entries keep probing (legacy rollout: registry entries never expire,
+    so refusing unstamped probes would permanently disable dead-owner cleanup for
+    pre-upgrade registries — the same unstamped policy as the state.db flock
+    records; unlike those records a JSON row has no kernel lock behind it, which
+    is why stamped rows gained the lease witness instead of living forever).
+    """
     unknown_dead = False if lenient else None
+    recorded = pidns.strip() if isinstance(pidns, str) and pidns.strip() else None
+    if not persistent_record_pidns_checkable(recorded):
+        return None  # foreign-namespace owner: its pid proves nothing here
     try:
         pid_int = int(pid)
     except (TypeError, ValueError):
@@ -359,9 +532,17 @@ def _pid_liveness(pid: Any, process_start_time: Any = None, *, lenient: bool = F
     return abs(current_start - expected_start) < 0.001
 
 
+def _foreign_stamped(entry: dict[str, Any]) -> bool:
+    """True when the entry carries a PID-namespace stamp this process cannot honour.
+    (Unstamped and same-namespace entries are False: their pid probes stand.)"""
+    recorded = _entry_pidns(entry)
+    return recorded is not None and not persistent_record_pidns_checkable(recorded)
+
+
 def _prune_dead(
     entries: list[dict[str, Any]], *, strict: bool = False,
     target_session_id: str | None = None, target_pid: int | None = None,
+    state_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Keep entries whose owner is alive; tracked/strict entries must be provably so.
 
@@ -372,23 +553,40 @@ def _prune_dead(
     longer refuses every claim/release for a different session id. See #113683.
     ``target_pid`` scopes the same way by owner pid (the orphan sweep only ever
     reclaims this process's own leases).
+
+    A foreign-namespace stamp makes the pid probe meaningless here, so the entry
+    is resolved by the kernel witness instead (see ``_witness_liveness``): held →
+    live (the owner is alive in its own namespace and must fence this one out);
+    acquired → its holder is gone, prune it and drop the stale witness; unreadable
+    → unknowable, kept live (never degraded to dead — that is the wrong-the-container
+    prune). Without a ``state_path`` the witness cannot be located and the entry
+    stays live, the conservative answer. Unstamped entries keep the old probe.
     """
     targeted = target_session_id is not None or target_pid is not None
     live: list[dict[str, Any]] = []
     for entry in entries:
         tracked = strict or bool(entry.get("track_liveness"))
         state = _pid_liveness(
-            entry.get("pid"), entry.get("process_start_time"), lenient=not tracked
+            entry.get("pid"), entry.get("process_start_time"),
+            pidns=entry.get("pidns"), lenient=not tracked,
         )
         if state is None:
-            if (
+            if _foreign_stamped(entry):
+                state = _witness_liveness(entry, state_path) if state_path else None
+                if state is False and state_path is not None:
+                    with suppress(OSError):
+                        _witness_path_for(state_path, str(entry.get("lease_id") or "")).unlink(missing_ok=True)
+            elif (
                 not targeted
                 or (target_session_id is not None
                     and str(entry.get("session_id") or "") == str(target_session_id))
                 or (target_pid is not None and entry.get("pid") == target_pid)
             ):
                 raise ActiveSessionRegistryError("active session owner liveness is unknown")
-            state = True
+            else:
+                state = True
+        if state is None and _foreign_stamped(entry):
+            state = True  # witness unreadable / pre-witness stamp: fail-closed, keep live
         if state:
             live.append(entry)
     return live
@@ -450,6 +648,7 @@ def _read_live_entries(
         return raw_entries, _prune_dead(
             raw_entries, strict=track_liveness,
             target_session_id=target_session_id, target_pid=target_pid,
+            state_path=state_path,
         )
     except ActiveSessionRegistryError:
         if track_liveness:
@@ -461,6 +660,7 @@ def _read_live_entries(
 def _lease_entry(
     *, lease_id: str, session_id: str, surface: str,
     metadata: Optional[dict[str, Any]] = None, track_liveness: bool = False,
+    state_path: Optional[Path] = None,
 ) -> dict[str, Any]:
     now = time.time()
     entry: dict[str, Any] = {
@@ -472,6 +672,32 @@ def _lease_entry(
         "started_at": now,
         "updated_at": now,
     }
+    # Stamp the writer's PID namespace: a bare pid is only evidence inside the
+    # namespace that wrote it, and sibling containers sharing one HERMES_HOME
+    # otherwise prune each other's live entries. The stamp is written only
+    # together with a HELD witness (and vice versa), so a stamped row is always
+    # reclaimable after the owner dies; an entry that cannot hold its witness
+    # stays fully unstamped and keeps the pre-stamp probe. A stamp of None also
+    # keeps the probe on single-namespace platforms.
+    global _warned_no_stamp
+    ns = pid_namespace_id()
+    if state_path is not None:
+        if ns is None:
+            if sys.platform == "linux" and not _warned_no_stamp:
+                _warned_no_stamp = True
+                logger.warning(
+                    "could not resolve this process' PID namespace (/proc/self/ns/pid);"
+                    " active-session entries stay unstamped and rely on the bare-pid probe"
+                )
+        elif _hold_witness(state_path, lease_id):
+            entry["pidns"] = ns
+            entry["lease_witness"] = _LEASE_WITNESS_VERSION
+        elif sys.platform == "linux" and not _warned_no_stamp:
+            _warned_no_stamp = True
+            logger.warning(
+                "could not hold the lease liveness witness under %s; active-session"
+                " entries stay unstamped and rely on the bare-pid probe", state_path.parent
+            )
     if track_liveness:
         entry["track_liveness"] = True
     if metadata:
@@ -504,11 +730,11 @@ def try_acquire_active_session(
             lease_id=lease_id, session_id=key, surface=str(surface), enabled=False
         ), None
 
+    state_path, lock_path = _lease_paths(registry_home=registry_home)
     entry = _lease_entry(
         lease_id=lease_id, session_id=key, surface=str(surface), metadata=metadata,
-        track_liveness=track_liveness,
+        track_liveness=track_liveness, state_path=state_path,
     )
-    state_path, lock_path = _lease_paths(registry_home=registry_home)
     lease = ActiveSessionLease(
         lease_id=lease_id, session_id=key, surface=str(surface), state_path=state_path,
         lock_path=lock_path, track_liveness=track_liveness,
@@ -591,6 +817,7 @@ def release_active_session(lease: ActiveSessionLease) -> None:
         if loaded is not None:
             _drop_lease(state_path, loaded[1], lease.lease_id)
         lease.released = True
+        _drop_witness(state_path, lease.lease_id)
 
 
 def transfer_active_session(
@@ -628,7 +855,7 @@ def transfer_active_session(
         elif lease.track_liveness:
             entries.append(_lease_entry(
                 lease_id=lease.lease_id, session_id=new_session_id, surface=lease.surface,
-                metadata=metadata, track_liveness=True,
+                metadata=metadata, track_liveness=True, state_path=state_path,
             ))
         else:
             return False
@@ -654,9 +881,17 @@ def _drop_self_orphans(
         return entries
     pid = os.getpid()
     cutoff = time.time() - _SELF_ORPHAN_GRACE_SECONDS
+
+    def _mine(entry: dict[str, Any]) -> bool:
+        if entry.get("pid") != pid:
+            return False
+        # A foreign-stamped entry is not "mine" even when its bare pid collides:
+        # sibling PID namespaces reuse small pids freely.
+        return not _foreign_stamped(entry)
+
     return [
         entry for entry in entries
-        if entry.get("pid") != pid
+        if not _mine(entry)
         or str(entry.get("lease_id") or "") in own_live_lease_ids
         or (_optional_float(entry.get("started_at")) or 0.0) > cutoff
     ]
@@ -680,6 +915,9 @@ def _release_orphaned_leases_in_home(registry_home: Path, live_lease_ids: set[st
         kept = _drop_self_orphans(entries, live_lease_ids)
         dropped = len(entries) - len(kept)
         if dropped:
+            for gone in entries:
+                if not any(k is gone for k in kept):
+                    _drop_witness(state_path, str(gone.get("lease_id") or ""))
             _write_entries(state_path, kept)
         return dropped
 
@@ -723,7 +961,7 @@ def active_session_registry_snapshot(
     state_path, lock_path = _lease_paths(registry_home=registry_home)
     with _FileLock(lock_path):
         raw_entries = _read_entries(state_path, strict=True)
-    entries = _prune_dead(raw_entries, strict=strict)
+    entries = _prune_dead(raw_entries, strict=strict, state_path=state_path)
     if entries != raw_entries:
         live_lease_ids = {str(entry.get("lease_id") or "") for entry in entries}
         dead_lease_ids = {
@@ -753,6 +991,7 @@ def active_session_liveness_guard(
     with _FileLock(lock_path):
         entries = _prune_dead(
             _read_entries(state_path, strict=True), strict=True, target_session_id=session_id,
+            state_path=state_path,
         )
         entries = _drop_self_orphans(entries, own_live_lease_ids)
         _write_entries(state_path, entries)
@@ -777,10 +1016,12 @@ def release_active_session_liveness_guard(
     with _FileLock(lock_path):
         entries = _prune_dead(
             _read_entries(state_path, strict=True), strict=True, target_session_id=session_id,
+            state_path=state_path,
         )
         kept = [e for e in entries if str(e.get("lease_id") or "") != lease.lease_id]
         kept = _drop_self_orphans(kept, own_live_lease_ids)
         if len(kept) != len(entries):
             _write_entries(state_path, kept)
         lease.released = True
+        _drop_witness(state_path, lease.lease_id)
         yield _holds_session(kept, session_id)

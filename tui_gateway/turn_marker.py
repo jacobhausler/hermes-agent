@@ -41,12 +41,21 @@ def _writer_identity() -> dict:
     this, and are they still alive?" (``marker_writer_state``); ``writer_start_time`` pairs the pid with its create
     time so a recycled pid cannot pass as the original writer. Identity is bookkeeping, never turn-critical, so
     every failure degrades to a bare pid."""
-    identity = {"writer_pid": os.getpid()}
+    identity: dict[str, Any] = {"writer_pid": os.getpid()}
     try:
         from hermes_cli.active_sessions import _own_start_time
         start = _own_start_time()
         if start is not None:
             identity["writer_start_time"] = float(start)
+    except Exception:
+        pass
+    try:
+        # Same rationale as the active_sessions entry stamp: the writer's pid is
+        # only evidence inside its own PID namespace.
+        from hermes_state_pidns import pid_namespace_id
+        ns = pid_namespace_id()
+        if ns:
+            identity["writer_pidns"] = ns
     except Exception:
         pass
     return identity
@@ -68,7 +77,8 @@ def marker_writer_state(entry: dict) -> str:
         return "unknown"
     try:
         from hermes_cli.active_sessions import _pid_liveness
-        live = _pid_liveness(pid, entry.get("writer_start_time"))
+        live = _pid_liveness(pid, entry.get("writer_start_time"),
+                             pidns=entry.get("writer_pidns"))
     except Exception:
         return "unknown"
     return "unknown" if live is None else ("alive" if live else "dead")
@@ -147,7 +157,7 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
         return {"attempts": max(0, int(entry.get("attempts") or 0)), "prompt": prompt, "started_at": _started_at(entry),
                 "auto_continue": bool(entry.get("auto_continue", True)),
                 # Writer identity when present: extra keys only, so a marker written by an older build still reads.
-                **{k: entry[k] for k in ("writer_pid", "writer_start_time") if entry.get(k) is not None},
+                **{k: entry[k] for k in ("writer_pid", "writer_start_time", "writer_pidns") if entry.get(k) is not None},
                 **({"notification_category": "diagnostic"}
                    if entry.get("notification_category") == "diagnostic" else {})}
     except Exception:

@@ -136,7 +136,7 @@ def quiescent_home(home: Path):
             raise RuntimeError(f"gateway is still active for {home}")
         stack.callback(_release_file_lock, gateway_lock)
         stack.enter_context(_FileLock(home / "runtime" / "active_sessions.lock"))
-        sessions = _prune_dead(_read_entries(home / "runtime" / "active_sessions.json", strict=True), strict=True)
+        sessions = _prune_dead(_read_entries(home / "runtime" / "active_sessions.json", strict=True), strict=True, state_path=home / "runtime" / "active_sessions.json")
         if sessions:
             pids = sorted({entry["pid"] for entry in sessions})
             raise RuntimeError(f"live chat sessions still own {home} (PIDs {pids}); close them before retrying")
