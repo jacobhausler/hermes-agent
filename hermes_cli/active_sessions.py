@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home, named_profile_is_live
+from hermes_state_pidns import pid_namespace_id, persistent_record_pidns_checkable
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -137,11 +138,18 @@ def format_refusal_stderr(message: str) -> str:
 def _is_same_writer(entry: dict[str, Any], metadata: Optional[dict[str, Any]]) -> bool:
     """True when an existing lease belongs to the very caller re-acquiring it.
     Identity is (pid, live_session_id): pid alone lets two live sessions in one process
-    steal each other's lease; the live id alone lets another process with an equal id."""
+    steal each other's lease; the live id alone lets another process with an equal id.
+    A foreign PID-namespace stamp vetoes even a pid match: sibling containers reuse
+    pids independently, so equal pid + equal live id across namespaces is two writers,
+    not one (est-2ek.1.886)."""
     try:
         if int(entry.get("pid") or -1) != os.getpid():
             return False
     except (TypeError, ValueError):
+        return False
+    recorded = entry.get("pidns")
+    recorded = recorded.strip() if isinstance(recorded, str) and recorded.strip() else None
+    if recorded is not None and recorded != pid_namespace_id():
         return False
     existing_live = str((entry.get("metadata") or {}).get("live_session_id") or "")
     incoming_live = str((metadata or {}).get("live_session_id") or "")
@@ -332,10 +340,25 @@ def _optional_float(value: Any) -> Optional[float]:
         return None
 
 
-def _pid_liveness(pid: Any, process_start_time: Any = None, *, lenient: bool = False) -> Optional[bool]:
+def _pid_liveness(
+    pid: Any, process_start_time: Any = None, *, pidns: Any = None, lenient: bool = False
+) -> Optional[bool]:
     """True/False for live/dead, or None when unknowable. ``lenient`` never returns None:
-    an unparseable pid or failed existence probe counts as dead, an unreadable start as alive."""
+    an unparseable pid or failed existence probe counts as dead, an unreadable start as alive.
+
+    ``pidns`` is the entry's PID-namespace stamp. A pid is only evidence INSIDE the
+    namespace that recorded it: two containers sharing one HERMES_HOME see each
+    other's live processes as absent and prune each other's entries (est-2ek.1.886).
+    A foreign-stamped entry is therefore unknowable — never dead — even under
+    ``lenient``: degrading it to dead is exactly the wrong-the-container prune this
+    gate exists to stop. Unstamped entries keep probing (legacy rollout: registry
+    entries never expire, so refusing unstamped probes would permanently disable
+    dead-owner cleanup for pre-upgrade registries — same policy as the flock records).
+    """
     unknown_dead = False if lenient else None
+    recorded = pidns.strip() if isinstance(pidns, str) and pidns.strip() else None
+    if not persistent_record_pidns_checkable(recorded):
+        return None  # foreign-namespace owner: its pid proves nothing here
     try:
         pid_int = int(pid)
     except (TypeError, ValueError):
@@ -359,6 +382,14 @@ def _pid_liveness(pid: Any, process_start_time: Any = None, *, lenient: bool = F
     return abs(current_start - expected_start) < 0.001
 
 
+def _foreign_stamped(entry: dict[str, Any]) -> bool:
+    """True when the entry carries a PID-namespace stamp this process cannot honour.
+    (Unstamped and same-namespace entries are False: their pid probes stand.)"""
+    recorded = entry.get("pidns")
+    recorded = recorded.strip() if isinstance(recorded, str) and recorded.strip() else None
+    return recorded is not None and not persistent_record_pidns_checkable(recorded)
+
+
 def _prune_dead(
     entries: list[dict[str, Any]], *, strict: bool = False,
     target_session_id: str | None = None, target_pid: int | None = None,
@@ -372,23 +403,33 @@ def _prune_dead(
     longer refuses every claim/release for a different session id. See #113683.
     ``target_pid`` scopes the same way by owner pid (the orphan sweep only ever
     reclaims this process's own leases).
+
+    A foreign-namespace stamp is the STRONGER case of "unknowable": the pid probe
+    is meaningless here, so the entry always stays live — including for the
+    targeted session — never a registry error. Per-session exclusivity then
+    refuses the claim through the normal owner-held path (est-2ek.1.886: the
+    sibling container's desktop lease must fence a CLI out, not be pruned away).
     """
     targeted = target_session_id is not None or target_pid is not None
     live: list[dict[str, Any]] = []
     for entry in entries:
         tracked = strict or bool(entry.get("track_liveness"))
         state = _pid_liveness(
-            entry.get("pid"), entry.get("process_start_time"), lenient=not tracked
+            entry.get("pid"), entry.get("process_start_time"),
+            pidns=entry.get("pidns"), lenient=not tracked,
         )
         if state is None:
-            if (
+            if _foreign_stamped(entry):
+                state = True  # unprovable BY CONSTRUCTION: treat as live, never dead
+            elif (
                 not targeted
                 or (target_session_id is not None
                     and str(entry.get("session_id") or "") == str(target_session_id))
                 or (target_pid is not None and entry.get("pid") == target_pid)
             ):
                 raise ActiveSessionRegistryError("active session owner liveness is unknown")
-            state = True
+            else:
+                state = True
         if state:
             live.append(entry)
     return live
@@ -472,6 +513,13 @@ def _lease_entry(
         "started_at": now,
         "updated_at": now,
     }
+    # Stamp the writer's PID namespace: a bare pid is only evidence inside the
+    # namespace that wrote it, and sibling containers sharing one HERMES_HOME
+    # otherwise prune each other's live entries (est-2ek.1.886). None on
+    # single-namespace platforms — a missing stamp keeps the pre-stamp probe.
+    ns = pid_namespace_id()
+    if ns:
+        entry["pidns"] = ns
     if track_liveness:
         entry["track_liveness"] = True
     if metadata:
@@ -653,10 +701,23 @@ def _drop_self_orphans(
     if own_live_lease_ids is None:
         return entries
     pid = os.getpid()
+    own_ns = pid_namespace_id()
     cutoff = time.time() - _SELF_ORPHAN_GRACE_SECONDS
+
+    def _mine(entry: dict[str, Any]) -> bool:
+        if entry.get("pid") != pid:
+            return False
+        # A foreign-stamped entry is not "mine" even when its bare pid collides:
+        # sibling PID namespaces reuse small pids freely (est-2ek.1.886).
+        recorded = entry.get("pidns")
+        recorded = recorded.strip() if isinstance(recorded, str) and recorded.strip() else None
+        if recorded is not None and recorded != own_ns:
+            return False
+        return True
+
     return [
         entry for entry in entries
-        if entry.get("pid") != pid
+        if not _mine(entry)
         or str(entry.get("lease_id") or "") in own_live_lease_ids
         or (_optional_float(entry.get("started_at")) or 0.0) > cutoff
     ]
