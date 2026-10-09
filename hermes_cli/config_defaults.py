@@ -90,6 +90,12 @@ DEFAULT_CONFIG = {
         # on expiry the message is rejected with a resend notice. Keep short: Telegram dispatches
         # sequentially, so a waiter delays unrelated topics. Non-positive -> 5s.
         "gateway_turn_lease_timeout": 5,
+        # Cross-process per-session turn lease (state.db): how long a turn waits, polling, for
+        # another Hermes process that holds the same session before giving up (session_busy).
+        # Typo/NaN/Inf/non-positive values warn and fall back to the 1800 s default.
+        "turn_lease": {
+            "wait_seconds": 1800,
+        },
         # Per-session AIAgent cache in the gateway. Each entry keeps a warm prompt prefix AND the
         # full transcript: too small re-pays uncached prompts, too large fills the heap.
         "agent_cache": {

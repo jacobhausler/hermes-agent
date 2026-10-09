@@ -595,6 +595,23 @@ class SessionCompressionMixin:
             )[0]
         return bool(self._execute_write(_do, patience_s=patience_s))
 
+    def get_session_turn_lease(self, session_id: str) -> Optional[tuple]:
+        """Current (non-expired) ``(holder, acquired_at, expires_at)`` turn-lease row for
+        ``session_id``, or None. Diagnostic only — admission decisions still funnel through
+        ``try_acquire_session_turn_lease``; the key walk and the read use separate read
+        transactions, which is fine exactly because nothing may decide on this answer."""
+        if not session_id:
+            return None
+        try:
+            conversation_id = self._session_turn_lease_key(session_id)
+            row = self._read_one(
+                "SELECT holder, acquired_at, expires_at FROM session_turn_leases "
+                "WHERE conversation_id = ? AND expires_at >= ?", (conversation_id, time.time()))
+            return tuple(row) if row else None
+        except Exception:
+            logger.debug("session turn lease diagnostic read failed", exc_info=True)
+            return None
+
     def acquire_session_turn_lease(
         self, session_id: str, holder: str, *, ttl_seconds: float = 300.0,
         wait_seconds: float = 1800.0, poll_interval_seconds: float = 1.0, on_wait=None,

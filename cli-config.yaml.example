@@ -1179,6 +1179,13 @@ agent:
   # Non-positive values fall back to the 5-second default.
   # gateway_turn_lease_timeout: 5
 
+  # How long a turn waits, polling, for another Hermes process (CLI/desktop/gateway
+  # sharing one HERMES_HOME) that holds the same session's cross-process turn lease
+  # before failing with "session busy, send again". Typo/NaN/Inf/non-positive values
+  # warn and fall back to the 1800-second default.
+  # turn_lease:
+  #   wait_seconds: 1800
+
   # Staged warning: send a warning before escalating to full timeout.
   # Fires once per run when inactivity reaches this threshold (seconds).
   # Set to 0 to disable the warning.

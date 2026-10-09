@@ -117,6 +117,13 @@ def holder_pid_checkable(holder: str) -> bool:
     return _qualify(_recorded_namespace(holder), unstamped_checkable=False)
 
 
+def recorded_namespace(holder: str) -> Optional[str]:
+    """Public view of the ``pidns=`` stamp a holder records (None when it carries
+    none). Diagnostics only: pair with :func:`holder_pid_checkable` — an absent
+    stamp on a TTL row is just as unprovable as a foreign one."""
+    return _recorded_namespace(holder)
+
+
 def persistent_record_pidns_checkable(recorded: Optional[str]) -> bool:
     """LEGACY ROLLOUT: may a persistent record (no expiry) be probed here?
 

@@ -31,6 +31,33 @@ _REFRESH_WRITE_PATIENCE_S = 20.0
 _REFRESH_EXPIRY_MARGIN_S = 2.0
 
 
+def resolve_lease_wait_seconds(config: Any = None) -> float:
+    """The turn-lease admission wait from ``agent.turn_lease.wait_seconds``, else the
+    1800 s default. Validation mirrors agent/turn_liveness: a typo, NaN, Inf, bool or
+    non-positive value warns and falls back (never raises). The bare constant gave an
+    operator no way to shorten the wait after a wedge."""
+    import math
+
+    agent_cfg = config.get("agent") if isinstance(config, dict) else None
+    section = agent_cfg.get("turn_lease") if isinstance(agent_cfg, dict) else None
+    raw = section.get("wait_seconds", LEASE_WAIT_SECONDS) if isinstance(section, dict) else LEASE_WAIT_SECONDS
+    if raw is None:  # an explicit YAML ``wait_seconds:`` is the section default, not a typo
+        return LEASE_WAIT_SECONDS
+    try:
+        value = float(raw) if not isinstance(raw, bool) else math.nan
+    except (TypeError, ValueError):
+        value = math.nan
+    if not math.isfinite(value) or value <= 0:
+        # Non-positive is a typo, not "no timeout": every other Hermes timeout knob reads
+        # 0 as unlimited, and a contended turn must never be rejected the instant it starts.
+        logger.warning(
+            "Invalid agent.turn_lease.wait_seconds in config.yaml: %r — falling back to default %.1f.",
+            raw, LEASE_WAIT_SECONDS,
+        )
+        return LEASE_WAIT_SECONDS
+    return value
+
+
 class DurableTurnLease:
     """An admitted session turn lease plus the periodic timers that keep it alive and watch the turn.
 
@@ -342,11 +369,22 @@ def admit_durable_turn_lease(
         )
 
     authority_floor = time.time()  # every acquisition attempt stamps its expiry after this instant
+    configured_wait = LEASE_WAIT_SECONDS
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        configured_wait = resolve_lease_wait_seconds(load_config_readonly() or {})
+    except Exception:
+        logger.debug("session turn lease wait config failed; using default", exc_info=True)
+
     if not db.acquire_session_turn_lease(
-        session_id, holder, ttl_seconds=LEASE_TTL_SECONDS, wait_seconds=LEASE_WAIT_SECONDS,
+        session_id, holder, ttl_seconds=LEASE_TTL_SECONDS, wait_seconds=configured_wait,
         on_wait=_on_wait, on_contended=_on_contended,
         should_abort=lambda: getattr(agent, "_interrupt_requested", False),
     ):
+        # Name the holder that kept the row (read AFTER the wait, so it is the holder that
+        # actually timed us out) — pure diagnostics: nothing decides on this read.
+        _log_session_turn_lease_timeout_holder(db, session_id, holder)
         admission.early_result = _lease_not_acquired_result(agent, session_id, conversation_history)
         return admission
 
@@ -437,6 +475,43 @@ def carry_unadmitted_user_message(
     append_message(early_result["messages"], deferred_user, timestamp=timestamp)
 
 
+def _log_session_turn_lease_timeout_holder(db, session_id: str, holder: str) -> None:
+    """Name the holder that kept the row after a lease-wait timeout: pid, pidns stamp,
+    platform and since-time at the one error log the operator reads. Read AFTER the
+    wait, so it names the holder that actually timed us out, not one that came and
+    went. Pure diagnostics: nothing decides on this read (same posture as
+    ``get_compression_lock_holder``), and a shim DB may lack the reader entirely."""
+    try:
+        reader = getattr(db, "get_session_turn_lease", None)
+        row = reader(session_id) if callable(reader) else None
+        if not isinstance(row, (tuple, list)) or len(row) < 2 or row[0] == holder:
+            return
+        from datetime import datetime, timezone
+
+        from hermes_state_pidns import holder_pid_checkable, recorded_namespace
+
+        foreign_holder = row[0]
+        try:
+            since = (datetime.fromtimestamp(float(row[1]), tz=timezone.utc)
+                     .strftime("%Y-%m-%dT%H:%M:%SZ") if row[1] is not None else "unknown")
+        except (OverflowError, OSError, ValueError, TypeError):
+            since = "unknown"
+        if holder_pid_checkable(foreign_holder):
+            probe = "probe-able"  # same namespace (or the platform has none): may be live
+        else:
+            ns = recorded_namespace(foreign_holder)
+            # The reclaim probe defers this row to its expiry: hermes_state_pidns.
+            probe = f"unprovable from this PID namespace ({'pidns=' + str(ns) if ns else 'unstamped(pre-upgrade)'})"
+        logger.error(
+            "session turn lease wait timed out for %s; held by %r (%s, since %s) — configure "
+            "agent.turn_lease.wait_seconds to tune the admission wait",
+            session_id, foreign_holder, probe, since,
+        )
+    except Exception:  # health: allow BLE001 -- pure diagnostics: a shim DB may raise anything and must never fail the turn
+        logger.debug("session turn lease holder diagnostics failed", exc_info=True)
+        logger.error("session turn lease wait timed out for %s", session_id)
+
+
 def _lease_not_acquired_result(agent, session_id: str, conversation_history) -> dict[str, Any]:
     base = {"messages": list(conversation_history or []), "api_calls": 0, "completed": False}
     if getattr(agent, "_interrupt_requested", False):
@@ -470,7 +545,6 @@ def _lease_not_acquired_result(agent, session_id: str, conversation_history) -> 
         "⏳ Another Hermes process kept this session busy too long. Your message was not "
         "processed - wait for the other process to finish, then send it again."
     )
-    logger.error("session turn lease wait timed out for %s", session_id)
     try:
         agent._emit_warning(timeout_msg)
     except Exception:
