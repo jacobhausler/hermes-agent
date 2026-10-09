@@ -25,6 +25,35 @@ _REASON_LEASE_LOST = "session turn lease lost"
 LEASE_TTL_SECONDS = 300.0
 LEASE_WAIT_SECONDS = 1800.0
 
+# est-2ek.1.885: a holder in a foreign (or unstamped) PID namespace can only be
+# proven dead at TTL expiry — the reclaim probe defers to the row's expiry, so
+# waiting past the TTL buys nothing except a parked turn. Failing fast is the
+# honest bound: TTL plus one poll of slack for the sweeper to land.
+_FOREIGN_NS_WAIT_FLOOR_S = LEASE_TTL_SECONDS + 30.0
+
+
+def resolve_lease_wait_seconds(config: Any = None) -> float:
+    """The turn-lease admission wait from ``agent.turn_lease.wait_seconds``, else the
+    1800 s default. A typo, NaN or Inf warns and falls back (never raises): the old
+    bare constant gave an operator no way to shorten the wait after a wedge.
+    ``<= 0`` means do not wait at all, which admission clamps per-holder below."""
+    import math
+
+    agent_cfg = config.get("agent") if isinstance(config, dict) else None
+    section = agent_cfg.get("turn_lease") if isinstance(agent_cfg, dict) else None
+    raw = section.get("wait_seconds", LEASE_WAIT_SECONDS) if isinstance(section, dict) else LEASE_WAIT_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = math.nan
+    if not math.isfinite(value):
+        logger.warning(
+            "Invalid agent.turn_lease.wait_seconds in config.yaml: %r — falling back to default %.1f.",
+            raw, LEASE_WAIT_SECONDS,
+        )
+        return LEASE_WAIT_SECONDS
+    return value
+
 
 class DurableTurnLease:
     """An admitted session turn lease plus the periodic timers that keep it alive and watch the turn.
@@ -283,12 +312,56 @@ def admit_durable_turn_lease(
             f"⏳ Still waiting for the other Hermes process on this session ({int(elapsed)}s)..."
         )
 
+    configured_wait = LEASE_WAIT_SECONDS
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        configured_wait = resolve_lease_wait_seconds(load_config_readonly() or {})
+    except Exception:
+        logger.debug("session turn lease wait config failed; using default", exc_info=True)
+
+    # est-2ek.1.885: read the row once, before waiting. A holder this process can
+    # never prove dead — a foreign or absent pidns stamp: the reclaim probe defers
+    # to TTL expiry (hermes_state_pidns) — must not park the turn for the full
+    # configured wait: nothing short of the TTL will free the row, and the
+    # operator cannot intervene from here. Clamp the wait to the TTL floor that
+    # actually bounds it, and hand the holder facts to the user and the log.
+    holder_diag = ""
+    effective_wait = max(0.0, configured_wait)
+    try:
+        row = (db.get_session_turn_lease(session_id)
+               if callable(getattr(type(db), "get_session_turn_lease", None)) else None)
+    except Exception:
+        row = None
+    if row is not None and row[0] != holder:
+        from datetime import datetime, timezone
+
+        from hermes_state_pidns import holder_pid_checkable, recorded_namespace
+
+        recorded_ns = recorded_namespace(row[0])
+        since = datetime.fromtimestamp(row[1], tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if row[1] else "unknown"
+        if not holder_pid_checkable(row[0]):
+            effective_wait = min(effective_wait, _FOREIGN_NS_WAIT_FLOOR_S)
+            ns_note = f"pidns={recorded_ns}" if recorded_ns else "pidns=unstamped(pre-upgrade)"
+            holder_diag = (
+                f" holder {row[0]!r} ({ns_note}, held since {since}, unprovable from this "
+                f"PID namespace — failing fast at {_FOREIGN_NS_WAIT_FLOOR_S:.0f}s "
+                f"(lease TTL {LEASE_TTL_SECONDS:.0f}s + sweeper slack) instead of "
+                f"waiting {configured_wait:.0f}s)"
+            )
+        else:
+            # Provable holder (same namespace, or the platform has none): the full wait
+            # stands — the reclaim may never come — but the facts still belong in the log.
+            holder_diag = f" holder {row[0]!r} (held since {since}, wait {effective_wait:.0f}s)"
+
     if not db.acquire_session_turn_lease(
-        session_id, holder, ttl_seconds=LEASE_TTL_SECONDS, wait_seconds=LEASE_WAIT_SECONDS,
+        session_id, holder, ttl_seconds=LEASE_TTL_SECONDS, wait_seconds=effective_wait,
         on_wait=_on_wait, on_contended=_on_contended,
         should_abort=lambda: getattr(agent, "_interrupt_requested", False),
     ):
-        admission.early_result = _lease_not_acquired_result(agent, session_id, conversation_history)
+        admission.early_result = _lease_not_acquired_result(
+            agent, session_id, conversation_history, holder_diag=holder_diag,
+        )
         return admission
 
     # Assign only after admission so the finally cannot release a holder that never owned the
@@ -376,7 +449,9 @@ def carry_unadmitted_user_message(
     append_message(early_result["messages"], deferred_user, timestamp=timestamp)
 
 
-def _lease_not_acquired_result(agent, session_id: str, conversation_history) -> Dict[str, Any]:
+def _lease_not_acquired_result(
+    agent, session_id: str, conversation_history, *, holder_diag: str = "",
+) -> Dict[str, Any]:
     base = {"messages": list(conversation_history or []), "api_calls": 0, "completed": False}
     if getattr(agent, "_interrupt_requested", False):
         logger.info("session turn lease wait aborted by interrupt: %s", session_id)
@@ -388,6 +463,7 @@ def _lease_not_acquired_result(agent, session_id: str, conversation_history) -> 
             "final_response": (
                 "Stopped waiting for another Hermes process on this session. "
                 "Your message was not processed."
+                + holder_diag
             ),
             **base,
             "interrupted": True,
@@ -408,8 +484,9 @@ def _lease_not_acquired_result(agent, session_id: str, conversation_history) -> 
     timeout_msg = (
         "⏳ Another Hermes process kept this session busy too long. Your message was not "
         "processed - wait for the other process to finish, then send it again."
+        + holder_diag
     )
-    logger.error("session turn lease wait timed out for %s", session_id)
+    logger.error("session turn lease wait timed out for %s%s", session_id, holder_diag or "")
     try:
         agent._emit_warning(timeout_msg)
     except Exception:
