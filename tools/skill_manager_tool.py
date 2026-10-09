@@ -179,12 +179,17 @@ def _validate_frontmatter(content: str, *, new_skill: bool = False) -> Optional[
     return None
 
 
-def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[str]:
+def _validate_content_size(content: str, label: str = "SKILL.md",
+                           overflow_path: str = "references/") -> Optional[str]:
+    # Byte-loud everywhere: a rejected write names limit/actual/delta/overflow-path so the
+    # agent never has to byte-measure across turns to learn how much to cut (est-2ek.1.887).
     if len(content) > MAX_SKILL_CONTENT_CHARS:
+        delta = len(content) - MAX_SKILL_CONTENT_CHARS
         return (
-            f"{label} content is {len(content):,} characters (limit: {MAX_SKILL_CONTENT_CHARS:,}). "
-            f"Consider splitting into a smaller SKILL.md with supporting files in references/ "
-            f"or templates/.")
+            f"{label} content is {len(content):,} characters, {delta:,} over the cap of "
+            f"{MAX_SKILL_CONTENT_CHARS:,}. Split the {label} — trim at least {delta:,} chars into "
+            f"supporting files under {overflow_path} of the skill directory "
+            f"(skill_manage action='write_file').")
     return None
 
 

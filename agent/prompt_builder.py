@@ -1564,18 +1564,25 @@ def _truncate_content(
         max_chars = _get_context_file_max_chars(context_length)
     if len(content) <= max_chars:
         return content
-    remedy = (
-        "trim the file, pin a larger context_file_max_chars, or use a larger-context model!" if queue_warning
-        else f"the full file stays readable with read_file: {read_path or filename}"
+    head_chars = int(max_chars * CONTEXT_TRUNCATE_HEAD_RATIO)
+    tail_chars = int(max_chars * CONTEXT_TRUNCATE_TAIL_RATIO)
+    # Byte-loud on every path: limit + actual + delta + overflow-path in one message, so a
+    # capped context file never costs turns of byte-measuring to understand (est-2ek.1.887).
+    # queue_warning only decides whether the chat status line also sees it.
+    overflow_path = read_path or filename
+    remedy = (" trim the file, pin a larger context_file_max_chars, or use a larger-context model."
+              if queue_warning else "")
+    msg = (
+        f"⚠️  Context file {filename} TRUNCATED: actual {len(content):,} chars exceeds limit of "
+        f"{max_chars:,} (delta {len(content) - max_chars:,} over; "
+        f"{len(content) - head_chars - tail_chars:,} chars omitted from the prompt).{remedy} "
+        f"Full file stays readable via read_file: {overflow_path}"
     )
-    msg = f"⚠️  Context file {filename} TRUNCATED: {len(content)} chars exceeds limit of {max_chars} — {remedy}"
     logger.warning(msg)
     if queue_warning:
         if (warnings := _truncation_warnings.get()) is None:
             _truncation_warnings.set(warnings := [])
         warnings.append(msg)
-    head_chars = int(max_chars * CONTEXT_TRUNCATE_HEAD_RATIO)
-    tail_chars = int(max_chars * CONTEXT_TRUNCATE_TAIL_RATIO)
     marker = (
         f"\n\n[...truncated {filename}: kept {head_chars}+{tail_chars} of {len(content)} chars. The middle is "
         f"omitted — if you need the full instructions, read the complete file with the read_file tool: "
