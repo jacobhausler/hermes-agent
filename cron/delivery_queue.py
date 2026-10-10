@@ -315,6 +315,43 @@ def recover_abandoned() -> int:
     return changed
 
 
+def _superseded_row(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
+    """True when a newer COMPLETED run of the same job finished after this pending row
+    was created — the message it carries is already stale ground.
+
+    A pending row can outlive its news: an interrupted/disabled run leaves it queued
+    while later fires complete normally, and a later drain replays the old stdout as a
+    fresh alert — under a job name the job no longer carries (est-2ek.1.667: a
+    pre-conversion truncated stdout re-delivered ~5.5h late). Only a ``completed``
+    ledger row supersedes: a crashed run's own undelivered message stays deliverable
+    (crash-retry parity), and the comparison is made on the ledger the worker itself
+    wrote, not on config mtime (which no consumer can read fail-closed across homes).
+    """
+    from cron.executions import _connect as _connect_executions
+
+    job_id = str(json.loads(row["job_json"]).get("id") or "")
+    if not job_id:
+        return False
+    econn = None
+    try:
+        econn = _connect_executions()
+        newer = econn.execute(
+            """SELECT 1 FROM executions
+               WHERE job_id=? AND status='completed'
+                 AND julianday(finished_at) > julianday(?)
+               LIMIT 1""",
+            (job_id, row["created_at"]),
+        ).fetchone()
+    except sqlite3.Error as exc:  # unreadable ledger: deliver rather than silently drop
+        logger.warning("Cron delivery %s: supersede check failed (%s); delivering",
+                       row["execution_id"], exc)
+        return False
+    finally:
+        if econn is not None:
+            econn.close()
+    return newer is not None
+
+
 def drain(
     send: Callable[[dict, str, bool], Optional[str]], *, limit: int = 20
 ) -> int:
@@ -322,6 +359,23 @@ def drain(
     recover_abandoned()
     processed = 0
     for _ in range(max(0, limit)):
+        with _lock, _transaction() as conn:
+            head = conn.execute(
+                "SELECT * FROM deliveries WHERE status='pending' "
+                "ORDER BY julianday(created_at), created_at, execution_id LIMIT 1"
+            ).fetchone()
+            if head is not None and _superseded_row(conn, head):
+                conn.execute(
+                    """UPDATE deliveries SET status='suppressed', finished_at=?,
+                       error='superseded by a newer completed run of the same job'
+                       WHERE execution_id=? AND status='pending'""",
+                    (_hermes_now().isoformat(), head["execution_id"]),
+                )
+                _prune_terminal_unlocked(conn)
+                logger.info(
+                    "Cron delivery %s: job re-ran to completion since this run — "
+                    "stale delivery dropped", head["execution_id"])
+                continue
         row = claim_next()
         if row is None:
             break

@@ -234,3 +234,73 @@ def test_same_gateway_recovers_terminalization_failure_without_resending(
     status = queue.get_status("exec-4")
     assert status["status"] == "unknown"
     assert "not retried" in status["error"]
+
+
+def _at(module, iso):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    module._hermes_now = lambda: datetime.fromisoformat(iso).replace(tzinfo=ZoneInfo("UTC"))
+
+
+def test_pending_delivery_superseded_by_newer_completed_run_is_dropped(tmp_path, monkeypatch):
+    """est-2ek.1.667: a stdout queued by a run that never delivered (interrupted,
+    pre-conversion) must not re-surface as a fresh alert after the SAME job already
+    ran to completion with fresh content."""
+    import cron.delivery_queue as queue
+    import cron.executions as executions
+
+    monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "deliveries.db")
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "executions.db")
+    _at(queue, "2026-10-10T10:10:00+00:00")
+    queue.enqueue("exec-old", {"id": "job-1"}, "truncated stdout under the OLD job name")
+    _at(executions, "2026-10-10T10:46:00+00:00")
+    newer = executions.create_execution("job-1", source="scheduled")
+    executions.finish_execution(newer["id"], success=True)
+
+    send = Mock(return_value=None)
+    assert queue.drain(send) == 0
+    send.assert_not_called()
+    status = queue.get_status("exec-old")
+    assert status["status"] == "suppressed"
+    assert "superseded" in (status["error"] or "")
+
+
+def test_pending_delivery_survives_when_newer_run_failed(tmp_path, monkeypatch):
+    """Only a COMPLETED run supersedes: a crashed run's own undelivered message stays
+    deliverable (crash-retry parity) — dropping it would silence the crash alert."""
+    import cron.delivery_queue as queue
+    import cron.executions as executions
+
+    monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "deliveries.db")
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "executions.db")
+    _at(queue, "2026-10-10T10:10:00+00:00")
+    queue.enqueue("exec-old", {"id": "job-1"}, "real report worth delivering")
+    _at(executions, "2026-10-10T10:46:00+00:00")
+    newer = executions.create_execution("job-1", source="scheduled")
+    executions.finish_execution(newer["id"], success=False, error="worker died")
+
+    send = Mock(return_value=None)
+    assert queue.drain(send) == 1
+    send.assert_called_once()
+    assert queue.get_status("exec-old")["status"] == "delivered"
+
+
+def test_pending_delivery_survives_when_completed_run_predates_it(tmp_path, monkeypatch):
+    """A completed run that finished BEFORE the pending row was queued is not this
+    row's successor — the pending content is the newer news and must deliver."""
+    import cron.delivery_queue as queue
+    import cron.executions as executions
+
+    monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "deliveries.db")
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "executions.db")
+    _at(executions, "2026-10-10T09:00:00+00:00")
+    older = executions.create_execution("job-1", source="scheduled")
+    executions.finish_execution(older["id"], success=True)
+    _at(queue, "2026-10-10T10:10:00+00:00")
+    queue.enqueue("exec-new", {"id": "job-1"}, "newest stdout")
+
+    send = Mock(return_value=None)
+    assert queue.drain(send) == 1
+    send.assert_called_once()
+    assert queue.get_status("exec-new")["status"] == "delivered"
