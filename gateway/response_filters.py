@@ -81,10 +81,13 @@ def is_autonomous_silence_response(response: Any) -> bool:
     Models reliably bracket ``[SILENT]`` with a short note, so unlike the
     interactive EXACT rule this also suppresses when a marker sits on its own
     first/last line, opens the response (``[SILENT] No changes detected``), or
-    trails the final line (``All clear. [SILENT]`` — the model only forgot the
-    newline; the bare sentinel must never ship).  Only the bracketed form gets
-    the edge-token rules: an unbracketed word is ordinary prose wherever it
-    sits.  A token buried mid-sentence is still delivered.
+    stands as the response's final SENTENCE (``All clear today. [SILENT]`` —
+    the model only forgot the newline; the bare sentinel must never ship).
+    The trailing form must be bracketed AND follow a full stop (any script),
+    which is what separates a tacked-on sentinel from the marker quoted as
+    data: ``Watchdog probe result: [SILENT]`` or ``The agent replied with
+    [静默]`` integrate the token grammatically and are ordinary content.
+    A token buried mid-sentence is still delivered.
     Shares :data:`LIVE_GATEWAY_SILENT_MARKERS` so the two sets cannot drift.
     """
     stripped = response.strip() if isinstance(response, str) else ""
@@ -98,8 +101,22 @@ def is_autonomous_silence_response(response: Any) -> bool:
         is_intentional_silence_response(c) for c in (stripped, lines[0], lines[-1])
     ):
         return True
-    trailing = lines[-1].rsplit(None, 1)[-1]
-    return trailing.startswith("[") and is_intentional_silence_response(trailing)
+    trailing_start = lines[-1].rfind("[")
+    if trailing_start < 0:
+        return False
+    trailing = lines[-1][trailing_start:]
+    if not is_intentional_silence_response(trailing):
+        return False
+    # The trailing sentinel stands in for its own sentence: only a full stop
+    # (ASCII or CJK) — or the line start — may precede it. A colon, comma, or
+    # plain word before the bracket means the prose integrates the marker as data.
+    before = lines[-1][:trailing_start].rstrip()
+    # An enclosing bracket or quote wrapping the sentinel is decoration, not
+    # grammar — peel it before reading the terminator.
+    while before and before[-1] in "([\"'“”‘’「『":
+        before = before[:-1].rstrip()
+    # An ellipsis (ASCII-run or single glyph) ends a sentence like a full stop.
+    return not before or before[-1] in ".!?。…"
 
 
 def is_intentional_silence_agent_result(agent_result: dict | None, response: Any) -> bool:
