@@ -29,6 +29,10 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # Delete tool-progress / "⏳ Working" bubbles after a SUCCESSFUL final response where deletion is
     # supported (Telegram); failed runs keep them as breadcrumbs.
     "cleanup_progress": False,
+    # Background self-improvement notices ("💾 Self-improvement review: …"): off (review still
+    # runs, nothing is sent) | on (generic "Memory updated") | verbose (content preview).
+    # The review itself is never gated here — only its chat notice (see agent/background_review).
+    "memory_notifications": "on",
     # Working-state text on text-rendering indicators (Slack assistant status): "full"/true = verb +
     # argument preview, "verb" = verb only (keeps paths out of shared channels), "off"/false = static.
     "live_status": "full",
@@ -52,7 +56,10 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # Mobile inbox: quiet tool_progress / busy-ack, but keep interim commentary and heartbeats so it
     # doesn't look like "typing..." for 30 minutes.
     "telegram": {**_TIER_HIGH, "tool_progress": "off", "busy_ack_detail": False},
-    "discord": {**_TIER_HIGH, "reasoning_style": "subtext"},  # "-# " subtext reads as metadata
+    # Discord bot seats are shared guild/thread surfaces: the background self-improvement
+    # notice is opt-IN there (owner ruling, est-2ek.1.922 intake) — set
+    # display.platforms.discord.memory_notifications: on (or the global key) to bring it back.
+    "discord": {**_TIER_HIGH, "reasoning_style": "subtext", "memory_notifications": "off"},  # "-# " subtext reads as metadata
     # Slack: Bolt posts cannot be edited like CLI; "new"/"all" spam permanent lines.
     "slack": {**_TIER_MEDIUM, "tool_progress": "off", "long_running_notifications": False, "busy_ack_detail": False},
     "mattermost": _TIER_MEDIUM,
@@ -209,6 +216,7 @@ _NORMALISERS: dict[str, Any] = {
     "busy_steer_ack_enabled": _norm_bool,
     "thinking_progress": _norm_bool,
     "cleanup_progress": _norm_cleanup_progress,
+    "memory_notifications": _norm_tristate("on", "off", {"on", "verbose", "off"}),
     "live_status": _norm_tristate("full", "off", {"full", "verb", "off"}, extra_truthy={"all"}),
     "tool_progress_grouping": _norm_choice(("accumulate", "separate")),
     "reasoning_style": _norm_choice(("code", "blockquote", "subtext")),
