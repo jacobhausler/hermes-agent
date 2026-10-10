@@ -390,6 +390,17 @@ def _append_file_mutation_footer(agent, final_response, logger):
         # surfaced on every turn, so over-claiming is structurally impossible past the model. Gate: only
         # applied when a real text response exists for this turn and the user didn't interrupt.
         # Empty/interrupted turns already have other surface text that shouldn't be augmented.
+        # A bare intentional-silence marker is delivery-decision text, not a
+        # summarised answer: appending the footer here turns "[SILENT]" into
+        # "[SILENT]\n\n<footer>", which the gateway's whole-answer silence check
+        # (response_filters.is_intentional_silence_response) no longer matches,
+        # so the footer ships to the channel. Match the marker with the SAME
+        # canonical matcher the delivery side uses (late import, same shape as
+        # verification_stop.py) so the two rules cannot drift.
+        from gateway.response_filters import is_intentional_silence_response
+
+        if is_intentional_silence_response(final_response):
+            return final_response
         _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
         if _failed and agent._file_mutation_verifier_enabled():
             _failed = agent._file_mutations_still_failed(_failed)
