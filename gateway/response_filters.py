@@ -80,8 +80,11 @@ def is_autonomous_silence_response(response: Any) -> bool:
 
     Models reliably bracket ``[SILENT]`` with a short note, so unlike the
     interactive EXACT rule this also suppresses when a marker sits on its own
-    first/last line or the bracketed sentinel opens the response (``[SILENT] No
-    changes detected``).  A token buried mid-sentence is still delivered.
+    first/last line, opens the response (``[SILENT] No changes detected``), or
+    trails the final line (``All clear. [SILENT]`` — the model only forgot the
+    newline; the bare sentinel must never ship).  Only the bracketed form gets
+    the edge-token rules: an unbracketed word is ordinary prose wherever it
+    sits.  A token buried mid-sentence is still delivered.
     Shares :data:`LIVE_GATEWAY_SILENT_MARKERS` so the two sets cannot drift.
     """
     stripped = response.strip() if isinstance(response, str) else ""
@@ -91,9 +94,12 @@ def is_autonomous_silence_response(response: Any) -> bool:
     # Bracketed form only for the prefix rule, so a bare "Silent retry succeeded" is NOT swallowed.
     # Same de-punctuating forms as the interactive rule, so ``【静默】`` / ``静默。`` cannot
     # be suppressed in chat yet delivered by cron.
-    return stripped.upper().startswith(_BRACKETED_SILENCE_MARKERS) or any(
+    if stripped.upper().startswith(_BRACKETED_SILENCE_MARKERS) or any(
         is_intentional_silence_response(c) for c in (stripped, lines[0], lines[-1])
-    )
+    ):
+        return True
+    trailing = lines[-1].rsplit(None, 1)[-1]
+    return trailing.startswith("[") and is_intentional_silence_response(trailing)
 
 
 def is_intentional_silence_agent_result(agent_result: dict | None, response: Any) -> bool:
