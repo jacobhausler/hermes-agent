@@ -1512,6 +1512,64 @@ def _apply_in_dir(args) -> None:
     args.no_restore_cwd = True
 
 
+# Session provenance values owned by an interactive app window, not by a terminal.
+# ``created_source`` is immutable provenance (#56439); ``webui``/``dashboard`` ride the
+# same tui_gateway backend as ``desktop``/``tui``. The CLI refuses -c/--resume into a
+# session one of these created (see _guard_cli_resume_ownership, est-2ek.1.884).
+_INTERACTIVE_SESSION_SOURCES = frozenset({"desktop", "tui", "webui", "dashboard"})
+
+
+def _guard_cli_resume_ownership(args, *, use_tui: bool) -> None:
+    """Refuse a headless CLI turn inside a session the desktop/TUI created (est-2ek.1.884).
+
+    ``hermes chat -c <title> --create-if-missing`` once resolved to a desktop-created
+    session and ran a full CLI turn in it, holding that session's state.db turn lease
+    for 50 minutes while the user's desktop window sat waiting for its own next prompt.
+    A CLI copy of an interactive session is a second writer; the active-session registry
+    fences that only while the owning process is live AND pid-namespace-checkable, so
+    provenance — the immutable ``created_source`` stamp — is the cheaper, namespace-proof
+    gate. Refuse with the facts; ``HERMES_CLI_RESUME_ANY_SURFACE=1`` overrides (a script
+    that has checked the window is gone can proceed, loudly). TUI resumes are exempt:
+    desktop and TUI are the same interactive class and legitimately reattach.
+    """
+    resume_id = getattr(args, "resume", None)
+    if not resume_id or use_tui:
+        return
+    row = None
+    try:  # never let the guard itself break startup
+        with _session_db() as db:
+            if db is not None:
+                try:
+                    row = db.get_session(str(resume_id))
+                except Exception:
+                    row = None
+    except Exception:
+        row = None
+    if row is None:
+        return  # unknown row: _init_agent reports "Session not found" with it
+    created = str(row.get("created_source") or row.get("source") or "").strip().lower()
+    if created not in _INTERACTIVE_SESSION_SOURCES:
+        return
+    from utils import is_truthy_value
+    if is_truthy_value(os.environ.get("HERMES_CLI_RESUME_ANY_SURFACE", ""), default=False):
+        print(
+            f"⚠ resuming a {created}-created session from the CLI anyway "
+            f"(HERMES_CLI_RESUME_ANY_SURFACE): the {created} window owns this chat; "
+            "this turn may interleave with it.",
+            file=sys.stderr,
+        )
+        return
+    print(
+        f"This session was opened by the {created} app — that window owns it, and a CLI\n"
+        f"turn here would take it over underneath the window. Continue in the {created}\n"
+        "window, or start a separate chat with `hermes` (no -c/--resume).\n"
+        "If you are sure the window is gone and this CLI should own the session instead,\n"
+        "set HERMES_CLI_RESUME_ANY_SURFACE=1.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def _import_foreign_resume(args) -> None:
     """--resume @claude / @codex: import a foreign session and resume it."""
     _resume_foreign = getattr(args, "resume", None)
@@ -1565,6 +1623,7 @@ def _resolve_chat_session_args(args, use_tui: bool) -> None:
     if resume_val:
         # On miss keep the original so _init_agent reports "Session not found" with it.
         args.resume = _resolve_session_by_name_or_id(resume_val) or resume_val
+        _guard_cli_resume_ownership(args, use_tui=use_tui)
 
     # cd back into a resumed session's recorded cwd (opt out: --no-restore-cwd;
     # --worktree owns its own dir). A missing dir warns and stays put.
