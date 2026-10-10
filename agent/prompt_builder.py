@@ -1048,8 +1048,13 @@ def _local_host_hints() -> list[str]:
     # The model reaches for the system temp dir by reflex (tmpfs on most Linux hosts, fills RAM);
     # naming Hermes' scratch dir here is what makes the TMPDIR export a habit rather than a hidden default.
     try:
-        host_lines.append(f"Scratch directory: {get_scratch_dir()} (TMPDIR points here; write temporary files "
-                          "and probes there, never under the system temp dir; entries idle for 24h are pruned)")
+        from agent.file_safety import is_write_denied
+
+        scratch = get_scratch_dir()
+        # The prompt must agree with the serving profile's actual write gate.
+        if not is_write_denied(str(scratch)):
+            host_lines.append(f"Scratch directory: {scratch} (TMPDIR points here; write temporary files "
+                              "and probes there, never under the system temp dir; entries idle for 24h are pruned)")
     except OSError:
         pass
     if not (sys.platform == "win32" and not is_wsl()):
