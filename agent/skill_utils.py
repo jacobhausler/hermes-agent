@@ -26,15 +26,148 @@ EXCLUDED_SKILL_DIRS = frozenset((
     ".tox", ".nox", ".pytest_cache", ".mypy_cache", ".ruff_cache",
 ))
 
+# Structural prune law (est-2ek.1.381): a directory whose name carries a
+# prune CONVENTION token — delimited tokens from backup/probe/graveyard
+# vocabulary, e.g. probes/, referrer-cut-backup/, *.backup-*,
+# claude-design.pre-fold-*, .grave/ — can never resolve as a skill, at any
+# depth, wherever it sits under a skills root. The name denylist above stays
+# as the second line; this rule is the first, so backups the owner moved
+# under a convention dir cannot re-materialize as index entries the way four
+# cut skills nearly did when the denylist missed 'probes'. A token must
+# match whole, on -delimited boundaries, so "shortcut" or "cutout" never
+# fire; tokens may themselves be compound (``pre-fold``).
+_PRUNE_DIR_MARKER_TOKENS = frozenset((
+    "probes", "backup", "backups", "cut", "grave", "graves",
+    "prune", "pruned", "pre-fold", "quarantine", "archive",
+))
+# Segment the NAME on dot/underscore boundaries; a token then matches a
+# segment (or a hyphen-bounded window inside one). A single ``[._-]+``
+# split shredded the compound marker ``pre-fold`` into ``pre``+``fold``
+# and made it unmatchable (est-2ek.1.788), so the split keeps hyphens in
+# the segment and the boundary checks below supply the -delimiting.
+_PRUNE_TOKEN_SPLIT = re.compile(r"[._]+")
+
+_WIN_ANCHOR_RE = re.compile(r"^(?:[a-zA-Z]:[\\/]|\\\\[^\\]+)")
+
+
+def _is_win_anchor(part) -> bool:
+    """True when a Windows pure-path ``parts`` leading element is an
+    absoluteness anchor: a drive (``C:\\``, as WinDrive) or a UNC server share
+    (``\\\\server\\share``, as WinRpt). POSIX ``parts`` never look like this."""
+    return bool(_WIN_ANCHOR_RE.match(str(part)))
+
+
+def _name_segment_matches_token(seg: str, tok: str) -> bool:
+    """Whole-token match on ``-`` boundaries within one dot/underscore segment."""
+    return (seg == tok
+            or seg.startswith(tok + "-")
+            or seg.endswith("-" + tok)
+            or ("-" + tok + "-") in seg)
+
+
+def is_prune_convention_dirname(name: str) -> bool:
+    """True when a directory NAME carries a prune convention token.
+
+    Matches whole delimited tokens (case-insensitive), never substrings:
+    the name is segmented on ``[._]`` and a token may match a whole segment
+    or a ``-``-delimited window inside one, so ``referrer-cut-backup``,
+    the compound ``claude-design.pre-fold-1790`` and ``.grave`` fire;
+    ``shortcut``, ``layout-cutout``, ``gradegrinder`` do not.
+    """
+    for seg in _PRUNE_TOKEN_SPLIT.split(name.lower()):
+        if not seg:
+            continue
+        if any(_name_segment_matches_token(seg, tok)
+               for tok in _PRUNE_DIR_MARKER_TOKENS):
+            return True
+    return False
+
+
+def is_prune_convention_path(path, *, root: Optional[PurePath] = None) -> bool:
+    """True when any component BELOW the declared *root* carries a prune
+    convention token. With no root supplied, falls back to the last
+    ``skills`` anchor (see _prune_checked_parts)."""
+    return any(is_prune_convention_dirname(part)
+               for part in _prune_checked_parts(PurePath(str(path)).parts, root))
+
+
+def skill_discovery_followlinks() -> bool:
+    """``skills.followlinks`` (default True): follow directory symlinks during
+    the discovery walk. Kept on by default because symlinked skill dirs
+    (``skills/<name>`` -> a checkout elsewhere) are a supported convention;
+    set false to harden the walk against symlinked subtrees. Prune-convention
+    dirs are pruned on the LEXICAL path either way, so a ``probes`` -> vault
+    symlink cannot smuggle backups back in."""
+    raw = _skills_cfg_get("followlinks")
+    if isinstance(raw, str):
+        return raw.strip().lower() not in ("false", "0", "no", "off")
+    return bool(raw) if raw is not None else True
+
+
+def _prune_walk_dirs(dirs: list, has_skill_md: bool) -> None:
+    """In-place dir filter shared by every skill discovery walker: name
+    denylist + per-skill support dirs + the STRUCTURAL prune convention."""
+    dirs[:] = [
+        d for d in dirs
+        if d not in EXCLUDED_SKILL_DIRS
+        and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
+        and not is_prune_convention_dirname(d)
+    ]
+
 # Progressive-disclosure support dirs inside a skill package: loaded explicitly
 # via skill_view(skill, file_path=...), never scanned as standalone skills.
 SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
 
-def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
+def _prune_checked_parts(parts, root: Optional[PurePath] = None) -> list:
+    """Components of a discovered path that the prune-convention rule judges.
+
+    Only components BELOW the declared *root* count: the walk starts at that
+    root, so its relative path — not its absolute ancestry — is the discovery
+    shape (est-2ek.1.789). When *root* is supplied and the path is absolute,
+    judge its tail relative to the root (an external root sitting under
+    ``~/backups/`` keeps its legitimate skills); a root-relative caller form
+    is already the discovery shape and is judged whole. When the path carries
+    no such anchor (no root given), fall back to the last ``skills`` component
+    when present, else the whole sequence — this keeps ancestor noise
+    (a pytest tmp dir named ``test_*prune*``, a checkout under
+    ``~/backups/``) from excluding a legitimate skill.
+
+    Absoluteness is FLAVOR-AWARE (est-2ek.1.789): a POSIX path is absolute on
+    a leading ``/``; a Windows path is absolute on a drive anchor (``C:\\``)
+    or a UNC anchor (``\\\\server\\share``) — ``parts`` carries those as the
+    leading element(s), never as ``/``. The tail is computed with the SAME
+    pure-path class the caller's parts came from, so drive/UNC roots subtract
+    correctly instead of leaving the whole ancestry judged.
+    """
+    seq = list(parts)
+    if root is not None:
+        pure = (type(root)
+                if isinstance(root, PurePath) and type(root) is not PurePath
+                else PurePath)
+        absolute = bool(seq) and (seq[0] == "/" or _is_win_anchor(seq[0]))
+        if absolute:
+            try:
+                seq = list(pure(*seq).relative_to(pure(str(root))).parts)
+            except ValueError:
+                # Path isn't under the declared root; judge it whole.
+                pass
+        return seq
+    if "skills" in seq:
+        return seq[len(seq) - 1 - seq[::-1].index("skills") + 1:]
+    return seq
+
+
+def is_excluded_skill_path(path, *, root: Optional[PurePath] = None) -> bool:
     """True if *path* should be skipped by skill scanners (VCS/dependency/cache
-    dirs + support packages). Apply to every SKILL.md from a direct ``rglob``."""
-    parts = PurePath(str(path)).parts
-    return any(part in EXCLUDED_SKILL_DIRS for part in parts) or is_skill_support_path(path, root=root)
+    dirs + support packages + the STRUCTURAL prune-convention rule on the
+    path BELOW the declared *root* (or the last ``skills`` component when no
+    root is supplied) — backups parked under probes/, *.backup-*,
+    .grave/ etc. are excluded at any depth). Apply to every SKILL.md from a
+    direct ``rglob``; pass ``root=`` whenever you have the real declared root
+    so walker and filter agree (see _prune_checked_parts)."""
+    return (any(part in EXCLUDED_SKILL_DIRS for part in PurePath(str(path)).parts)
+            or is_skill_support_path(path, root=root)
+            or is_prune_convention_path(path, root=root))
 
 
 def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
@@ -841,11 +974,14 @@ def is_skill_description_truncated_for_prompt(frontmatter: dict[str, Any]) -> bo
 
 def iter_skill_index_files(skills_dir: Path, filename: str):
     """Walk skills_dir yielding sorted paths matching *filename*; prunes
-    EXCLUDED_SKILL_DIRS and support dirs of skill roots."""
+    EXCLUDED_SKILL_DIRS, support dirs of skill roots, and STRUCTURAL prune
+    dirs (probes/, *backup-*, *cut-backup*, .grave/, ... — see
+    is_prune_convention_dirname)."""
+    skills_dir_str = str(skills_dir)
     matches: list[str] = []
-    for root, dirs, files in os.walk(str(skills_dir), followlinks=True):
+    for root, dirs, files in os.walk(skills_dir_str, followlinks=skill_discovery_followlinks()):
         has_skill_md = "SKILL.md" in files
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
+        _prune_walk_dirs(dirs, has_skill_md)
         if filename in files:
             matches.append(os.path.join(root, filename))
     yield from map(Path, sorted(matches))
