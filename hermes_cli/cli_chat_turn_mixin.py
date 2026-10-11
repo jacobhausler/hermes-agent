@@ -35,6 +35,8 @@ class CLIChatTurnMixin:
         """Adopt ``fallback_providers`` edits made while this chat is open (#95066) — the same
         per-turn, fail-closed contract as the Desktop/TUI and messaging gateways: a torn config.yaml
         keeps the last known-good chain instead of reading as "chain removed"."""
+        if getattr(self, "_route_pinned", False):
+            return  # explicit --model+--provider pin: the ambient chain must not be borrowed or hot-reloaded (est-2ek.1.929)
         from cli import logger
         try:
             from gateway.run import GatewayRunner

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -722,6 +723,14 @@ def handle_content_policy_refusal(
     _refusal_text = (getattr(_refusal_result, "content", None) or "").strip()
     if not _refusal_text:
         _refusal_text = (agent._extract_reasoning(_refusal_result) or "").strip()
+    if not _refusal_text:
+        # Codex response-object refusals carry the provider message on `.error`
+        # (status=failed + error.code=content_policy_violation), not in a content block.
+        _err = getattr(response, "error", None)
+        if isinstance(_err, dict):
+            _refusal_text = str(_err.get("message") or "").strip()
+        elif _err is not None:
+            _refusal_text = str(getattr(_err, "message", None) or "").strip()
     # Anthropic stop_reason=refusal carries its reason on stop_details (category + optional explanation),
     # not in a content block — without it a classifier halt reads as "(no text)" (#113689).
     _stop_details = (getattr(_refusal_result, "provider_data", None) or {}).get("stop_details")
@@ -758,6 +767,13 @@ def handle_content_policy_refusal(
         _refusal_log or "(no text)",
     )
     agent._emit_diagnostic_status("⚠️ The model declined to respond to this request (safety refusal).")
+    agent._touch_activity(
+        "safety refusal (content_policy_blocked) — turn ended, no silent fallback",
+        provenance="agent.content_policy_blocked", force_persist=True)
+    _sdb, _sid = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
+    if _sdb is not None and _sid:
+        with suppress(Exception):
+            _sdb.update_session_billing(_sid, agent.provider, agent.base_url, agent.model)
     _refusal_response = "⚠️ " + content_policy_copy(
         label=provider_label_for(agent.provider),
         summary=_refusal_text or "the model returned no explanation",

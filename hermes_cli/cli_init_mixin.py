@@ -116,6 +116,10 @@ class CLIInitMixin:
         )
         # resume must not clobber an explicit -m with the session's stored model.
         self._explicit_model_override = bool(model)
+        # An explicit -m + --provider pin is a billing boundary: the run must never
+        # silently re-bill a provider refusal onto the ambient fallback chain (est-2ek.1.929).
+        self._explicit_provider_override = bool(provider)
+        self._route_pinned = bool(model) and bool(provider)
         self.model = model or _config_model or ""
         _cfg_provider = _model_config.get("provider") or os.getenv("HERMES_INFERENCE_PROVIDER")
         _startup_provider_override = _startup_base_url_override = _startup_api_key_override = ""
@@ -292,7 +296,7 @@ class CLIInitMixin:
             except (TypeError, ValueError):
                 pass
 
-        self._fallback_model = get_fallback_chain(CLI_CONFIG)
+        self._fallback_model = [] if self._route_pinned else get_fallback_chain(CLI_CONFIG)
 
     def _init_runtime_state(self, resume):
         """Session store + all per-run mutable state (queues, overlays, pet/voice/status-bar fields)."""

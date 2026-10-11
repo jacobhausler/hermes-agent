@@ -131,6 +131,10 @@ class ActivityTrackingMixin:
 
         See #15654, #72039.
         """
+        if getattr(self, "_last_activity_provenance", None) == ActivityProvenance.AGENT_CONTENT_POLICY_BLOCKED:
+            # A provider safety refusal is terminal evidence of why the turn died; keep the
+            # stamp on the durable row until the NEXT turn's activity overwrites it (est-2ek.1.929).
+            return
         self._last_activity_desc = ""
         self._last_activity_provenance = ActivityProvenance.UNKNOWN
         session_id = getattr(self, "session_id", None)

@@ -14,6 +14,7 @@ import locale
 import math
 import re
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1113,6 +1114,13 @@ def nonretryable_client_error_result(
     else:
         agent._persist_session(messages, conversation_history)
     if classified.reason == FailoverReason.content_policy_blocked:
+        agent._touch_activity(
+            "safety refusal (content_policy_blocked) — non-retryable, turn ended",
+            provenance="agent.content_policy_blocked", force_persist=True)
+        _sdb, _sid = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
+        if _sdb is not None and _sid:
+            with suppress(Exception):
+                _sdb.update_session_billing(_sid, agent.provider, agent.base_url, agent.model)
         return _content_policy_blocked_result(
             messages, api_call_count,
             final_response="⚠️ " + content_policy_copy(label=_plabel, summary=_nonretryable_summary),
@@ -1576,8 +1584,15 @@ def validate_response_shape(agent: Any, response: Any) -> tuple[bool, list[str]]
     if agent.api_mode == "codex_responses":
         _codex_resp_status = str(getattr(response, "status", "") or "").strip().lower()
         if _codex_resp_status in {"failed", "cancelled"}:
+            from agent.error_classifier import CODEX_CONTENT_POLICY_ERROR_CODES
+            _cse = _codex_soft_failure_error(response)
+            if _codex_resp_status == "failed" and str(_cse.get("code") or "").strip().lower() in CODEX_CONTENT_POLICY_ERROR_CODES:
+                # Deterministic safety refusal, not a transport/account failure: keep the
+                # response valid so the content_filter refusal path owns it — retrying or
+                # fallback re-bills a refusal that answers identically (est-2ek.1.929).
+                return False, []
             _codex_error_msg = (
-                _codex_soft_failure_error(response).get("message")
+                _cse.get("message")
                 or f"Responses API returned status '{_codex_resp_status}'"
             )
             logger.warning(

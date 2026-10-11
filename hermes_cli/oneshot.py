@@ -527,15 +527,29 @@ def _run_agent(
     session_db = _create_session_db_for_oneshot()
     resume_sid, conversation_history, resume_meta = _load_resume_target(session_db, resume)
     choice = _apply_stored_session_runtime(choice, resume_meta, explicit_model=bool((model or "").strip()))
+    # An explicit --model+--provider pin is a billing boundary: resolve exactly what was asked,
+    # let an AuthError surface loud, and carry no chain — walking the ambient one would silently
+    # re-bill a refusal elsewhere (est-2ek.1.929, resolution-time parity with #81209).
+    _pinned = bool((model or "").strip()) and bool((provider or "").strip())
     # Resolution-time fallback (#81209): a quota-exhausted/expired primary raises AuthError here, before
     # AIAgent (and its mid-session ``fallback_model`` wiring) exists, so walk the chain like the gateway.
-    runtime, fallback_entry = resolve_runtime_with_fallback(
-        cfg,
-        requested=choice.provider,
-        target_model=choice.model or None,
-        explicit_base_url=choice.base_url,
-        explicit_api_key=choice.api_key,
-    )
+    if _pinned:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        runtime = resolve_runtime_provider(
+            requested=choice.provider,
+            target_model=choice.model or None,
+            explicit_base_url=choice.base_url,
+            explicit_api_key=choice.api_key,
+        )
+        fallback_entry = None
+    else:
+        runtime, fallback_entry = resolve_runtime_with_fallback(
+            cfg,
+            requested=choice.provider,
+            target_model=choice.model or None,
+            explicit_base_url=choice.base_url,
+            explicit_api_key=choice.api_key,
+        )
     if fallback_entry is not None:
         # The chosen entry names the model that will be sent; the primary's stored api_mode no longer applies.
         choice = dataclasses.replace(choice, model=fallback_entry["model"], provider=runtime.get("provider"),
@@ -587,7 +601,7 @@ def _run_agent(
             session_db=session_db,
             session_id=resume_sid,
             credential_pool=runtime.get("credential_pool"),
-            fallback_model=get_fallback_chain(cfg) or None,
+            fallback_model=None if _pinned else (get_fallback_chain(cfg) or None),
             # The resolved provider's request body (a custom entry's extra_body), as `hermes chat` passes it.
             request_overrides=runtime.get("request_overrides"),
             ephemeral_system_prompt=skills_prompt,

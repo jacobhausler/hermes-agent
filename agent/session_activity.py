@@ -31,6 +31,9 @@ class ActivityProvenance(str, Enum):
     AGENT_COMPRESSION_TIMEOUT = "agent.compression_timeout"
     AGENT_COMPRESSION_COOLDOWN = "agent.compression_cooldown"
     AGENT_COMPRESSION_TURNHOLD = "agent.compression_turnhold"
+    # Terminal provider refusal (safety filter). Must survive the post-turn label clear so
+    # the sessions row proves WHY the turn failed / billing did not move (est-2ek.1.929).
+    AGENT_CONTENT_POLICY_BLOCKED = "agent.content_policy_blocked"
 
 
 # Provenances that END the user-visible "compressing" phase: the host's progress timeout, a cooldown/

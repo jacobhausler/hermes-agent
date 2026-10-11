@@ -12,6 +12,7 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, TypeGuard
 
+from agent.error_classifier import CODEX_CONTENT_POLICY_ERROR_CODES
 from agent.message_sanitization import coerce_tool_name, deterministic_call_id
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 from hermes_cli.route_identity import normalize_route_base_url
@@ -1170,6 +1171,15 @@ def _normalize_codex_response(
     response_status = _lower_or_none(getattr(response, "status", None))
     incomplete_reason = str(_field(getattr(response, "incomplete_details", None), "reason", "") or "").strip().lower()
     response_incomplete_content_filter = response_status == "incomplete" and incomplete_reason == "content_filter"
+    # A Codex `failed` Response whose error code is a policy block is the SAME deterministic
+    # safety refusal as an incomplete/content_filter — empty output is expected, not a
+    # retryable transport failure (est-2ek.1.929; mirrors the incomplete handling below).
+    _failed_policy_block = (
+        response_status == "failed"
+        and str(_field(getattr(response, "error", None), "code", "") or "").strip().lower()
+        in CODEX_CONTENT_POLICY_ERROR_CODES
+    )
+    response_safety_block = response_incomplete_content_filter or _failed_policy_block
     output = getattr(response, "output", None)
     if not isinstance(output, list) or not output:
         # Codex can deliver the whole answer via stream events with an empty output.
@@ -1179,7 +1189,7 @@ def _normalize_codex_response(
             msg = "Codex response has empty output but output_text is present (%d chars); synthesizing output item."
             logger.debug(msg, len(out_text))
             content: list[Any] = [SimpleNamespace(type="output_text", text=out_text)]
-        elif response_incomplete_content_filter:
+        elif response_safety_block:
             # Provider safety block, not a partial answer: finish content_filter, not incomplete.
             content = []
         else:
@@ -1187,7 +1197,7 @@ def _normalize_codex_response(
         response.output = output = [
             SimpleNamespace(type="message", role="assistant", status="completed", content=content),
         ]
-    if response_status in {"failed", "cancelled"}:
+    if response_status in {"failed", "cancelled"} and not response_safety_block:
         raise RuntimeError(_format_responses_error(getattr(response, "error", None), response_status))
     scan = _OutputScan(response_status)
     scan.scan(output, issuer_kind, issuer_model)
@@ -1239,7 +1249,7 @@ def _normalize_codex_response(
     )
     if tool_calls:
         finish_reason = "tool_calls"
-    elif response_incomplete_content_filter:
+    elif response_safety_block:
         finish_reason = "content_filter"
     elif (
         leaked_tool_call_text

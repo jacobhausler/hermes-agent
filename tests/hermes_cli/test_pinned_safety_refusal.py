@@ -80,7 +80,7 @@ def test_pinned_oneshot_refusal_stops_once_and_keeps_session_evidence(tmp_path, 
     request_count = []
     refusal = "Your request was rejected by our safety system."
 
-    def stream(agent, **kw):
+    def stream(agent, *_a, **kw):
         agents.append(agent)
         request_count.append(kw)
         # Make a forbidden second attempt finish promptly, rather than burn a backoff ladder.

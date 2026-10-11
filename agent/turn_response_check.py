@@ -61,6 +61,12 @@ def _codex_finish_reason(response: Any) -> str:
         return "incomplete"
     if status == "incomplete" and incomplete_reason == "content_filter":
         return "content_filter"
+    if status == "failed":
+        from agent.error_classifier import CODEX_CONTENT_POLICY_ERROR_CODES
+        error = getattr(response, "error", None)
+        code = error.get("code") if isinstance(error, dict) else getattr(error, "code", None)
+        if code is not None and str(code).strip().lower() in CODEX_CONTENT_POLICY_ERROR_CODES:
+            return "content_filter"
     return "stop"
 
 

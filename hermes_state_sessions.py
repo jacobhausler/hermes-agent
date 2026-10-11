@@ -735,6 +735,22 @@ class SessionSessionsMixin:
             (model_config_json, model, session_id),
         )
 
+    def update_session_billing(
+        self, session_id: str, billing_provider: Optional[str] = None,
+        billing_base_url: Optional[str] = None, model: Optional[str] = None,
+    ) -> None:
+        """COALESCE-stamp the billing attribution columns without touching token counts —
+        for terminal turns that record NO usage (a provider safety refusal still must prove
+        WHICH provider answered 'no'; est-2ek.1.929)."""
+        if not session_id or not (billing_provider or billing_base_url or model):
+            return
+        self._write_sql(
+            "UPDATE sessions SET billing_provider = COALESCE(?, billing_provider), "
+            "billing_base_url = COALESCE(?, billing_base_url), model = COALESCE(?, model) "
+            "WHERE id = ?",
+            (billing_provider, billing_base_url, model, session_id),
+        )
+
     def update_system_prompt(self, session_id: str, system_prompt: Optional[str]) -> None:
         """Store the full assembled system prompt snapshot."""
         def _do(conn):

@@ -362,6 +362,11 @@ _CONTENT_POLICY_BLOCKED_PATTERNS = (
     "prompt was flagged by our safety", "responses cannot be generated due to safety",
     "content_filter", "responsibleaipolicyviolation", "new_sensitive",
     "content exists risk",
+    # ChatGPT Codex refusal wording + the Responses-API error code verbatim (est-2ek.1.929):
+    # without these a 400 content-policy block is downgraded to format_error, which still
+    # aborts fallback but loses the refusal stamp and the refusal copy the user must see.
+    "rejected by the safety", "rejected by our safety",
+    "content_policy_violation", "content policy violation",
 )
 
 # Auth patterns (non-status-code signals).
@@ -467,6 +472,11 @@ _V_AUTH_FALLBACK = _v(_R.auth, **_ABORT_FALLBACK)
 _V_MODEL_NOT_FOUND = _v(_R.model_not_found, **_ABORT_FALLBACK)
 _V_UPSTREAM_BLOCKED = _v(_R.upstream_blocked, **_ABORT_FALLBACK)
 _V_CONTENT_BLOCKED = _v(_R.content_policy_blocked, **_ABORT_FALLBACK)
+# Codex Responses soft-failure error codes that are the same deterministic safety refusal
+# the finish_reason=content_filter path handles — never fallback material (est-2ek.1.929).
+CODEX_CONTENT_POLICY_ERROR_CODES = frozenset({
+    "content_policy_violation", "content_filter", "responsible_ai_policy_violation",
+})
 # Another account in the same pool may hold the entitlement; the credential itself is healthy.
 _V_MODEL_ENTITLEMENT = _v(_R.model_entitlement, retryable=False, **_ROTATE_FALLBACK)
 _V_FORMAT_ERROR = _v(_R.format_error, **_ABORT_FALLBACK)
