@@ -18,7 +18,7 @@ def test_scan_spares_only_the_callers_wrapper_shell(capsys):
     """The bash the ``--stop`` was typed into is dropped; the real backend and an unrelated
     wrapper with the same argv shape (another user's ``bash -c 'hermes serve'``) stay targets."""
     processes = [
-        (111, "/opt/hermes/bin/python hermes dashboard --port 9119"),
+        (111, "/opt/hermes/.venv/bin/python hermes dashboard --port 9119"),
         (222, "bash -c hermes dashboard --stop"),
         (333, "bash -c hermes serve"),
     ]
