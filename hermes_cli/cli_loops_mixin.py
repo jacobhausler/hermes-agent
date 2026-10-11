@@ -96,7 +96,7 @@ class CLILoopsMixin:
         if self._confirm_destructive_slash(
             "clear",
             "This clears the screen and starts a new session.\n"
-            "The current conversation history will be discarded.",
+            "The old session stays available via /resume.",
             cmd_original=cmd_original,
         ) is None:
             return True  # confirmation cancelled — command handled, keep REPL alive
@@ -196,7 +196,7 @@ class CLILoopsMixin:
         if self._confirm_destructive_slash(
             "new",
             "This starts a fresh session.\n"
-            "The current conversation history will be discarded.",
+            "The old session stays available via /resume.",
             cmd_original=cmd_original,
         ) is None:
             return True  # confirmation cancelled — command handled, keep REPL alive
