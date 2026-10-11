@@ -370,6 +370,34 @@ def _ambient_file_safety_profile_name() -> str:
     return _resolve_active_profile_name()
 
 
+def _shared_skill_dirs_note() -> str:
+    """One sentence naming every configured shared skill mount, or ``""``.
+
+    ``skills.create_dir`` / ``skills.external_dirs`` exist precisely to mount a
+    skill tree that several profiles (or the operator) share — including the
+    default root's ``skills/`` from a profile session. Without this sentence the
+    profile line's "Do NOT modify" warning contradicts the config: agents refuse
+    to write the very dir ``skill_manage`` creates into (feedback 00e0ca6919c1a274).
+    Resolved through ``get_skill_search_roots`` — the ONE ordering skill_view and
+    the prompt index share — so the prompt can never disagree with resolution.
+    """
+    try:
+        from agent.skill_utils import TIER_LOCAL, get_skill_search_roots
+        mounts = [d for tier, d in get_skill_search_roots(include_project=False)
+                  if tier != TIER_LOCAL]
+    except Exception:
+        logger.debug("shared skill dirs note skipped", exc_info=True)
+        return ""
+    if not mounts:
+        return ""
+    return (
+        "Configured skill mounts: " + ", ".join(str(d) for d in mounts)
+        + " — SHARED skill directories, writable from this session"
+        " (skills.create_dir / skills.external_dirs); the do-not-modify"
+        " warning covers only the other profiles' own trees."
+    )
+
+
 def _active_profile_line(agent: Any) -> str:
     """Name the running profile so the agent doesn't conflate ``~/.hermes/skills``
     (default) with ``~/.hermes/profiles/<active>/skills``.  Resolved from the
@@ -388,7 +416,7 @@ def _active_profile_line(agent: Any) -> str:
             "skills/, plugins/, cron/, and memories/ that affect a different "
             "session than this one. Do not modify another profile's "
             "skills/plugins/cron/memories unless the user explicitly directs "
-            "you to."
+            "you to." + _shared_skill_dirs_note()
         )
     # A non-default name is only returned when the resolved home is ALREADY
     # <root>/profiles/<name>, so the profile home is the session home itself.
@@ -406,7 +434,7 @@ def _active_profile_line(agent: Any) -> str:
         f"{default_root}/cron/, {default_root}/memories/ — those belong to a "
         f"different session run from a different shell. Do NOT modify "
         f"another profile's skills/plugins/cron/memories unless the user "
-        f"explicitly directs you to."
+        f"explicitly directs you to." + _shared_skill_dirs_note()
     )
 
 
