@@ -219,6 +219,36 @@ def build_write_denied_prefixes(home: str) -> list[str]:
     return [os.path.realpath(p) + os.sep for p in paths]
 
 
+# Per-child write grant (est-2mhl). A trusted launcher (the workflow runner, a
+# delegating parent) names the ONE directory a child it spawns must be able to
+# write, in the CHILD'S OWN process environment. It is deliberately a different
+# name from HERMES_WRITE_SAFE_ROOT: that variable is a per-profile ceiling that a
+# served profile's scope REPLACES (the multiplex isolation property), so a launcher
+# appending to it is silently dropped whenever the profile carries its own value.
+# This companion is read from the process environment only, never from a profile
+# scope or ``.env``, so it can neither be set by nor leak across profiles.
+WRITE_SAFE_ROOT_GRANT_ENV = "HERMES_WRITE_SAFE_ROOT_EXTRA"
+
+
+def _write_grant_roots() -> set[str]:
+    """Resolved per-child grant directories from ``HERMES_WRITE_SAFE_ROOT_EXTRA``.
+
+    Narrow by construction: entries must be absolute (no ``~`` expansion, no
+    cwd-relative surprise) and may never be the filesystem root. Credential and
+    protected-subpath denials run BEFORE the safe-root check, so a grant can only
+    re-admit paths the jail alone was excluding.
+    """
+    granted: set[str] = set()
+    for path in filter(None, os.getenv(WRITE_SAFE_ROOT_GRANT_ENV, "").split(os.pathsep)):
+        if not os.path.isabs(path):
+            continue
+        with suppress(OSError, ValueError):
+            real = os.path.realpath(path)
+            if real != os.path.dirname(real):
+                granted.add(real)
+    return granted
+
+
 def get_safe_write_roots() -> set[str]:
     """Resolved HERMES_WRITE_SAFE_ROOT paths (``os.pathsep``-separated list),
     read from the SERVING profile's own view.
@@ -244,6 +274,11 @@ def get_safe_write_roots() -> set[str]:
       ``cron/env_settings.cron_env_setting``, which has no ``os.environ``
       fallback. Total absence everywhere leaves roots empty, i.e. unrestricted
       by this guard (never a fail-closed empty jail) inside a VALID bound scope.
+
+    Whatever the view resolved, ``HERMES_WRITE_SAFE_ROOT_EXTRA`` (process env only,
+    see :data:`WRITE_SAFE_ROOT_GRANT_ENV`) is unioned on top while a jail is in
+    force: the launcher's per-child workdir grant survives a served profile's
+    replacing value, without widening that profile's own ceiling.
     """
     from agent.secret_scope import (
         current_secret_scope, get_secret_str, is_multiplex_active,
@@ -266,6 +301,10 @@ def get_safe_write_roots() -> set[str]:
     for path in filter(None, raw.split(os.pathsep)):
         with suppress(OSError, ValueError):
             roots.add(os.path.realpath(os.path.expanduser(path)))
+    if roots:
+        # A jail is in force: add the per-child grant. With no jail the guard stays
+        # inert -- a grant must never turn "unrestricted" into "jailed to the grant".
+        roots |= _write_grant_roots()
     return roots
 
 
