@@ -220,9 +220,50 @@ def build_write_denied_prefixes(home: str) -> list[str]:
 
 
 def get_safe_write_roots() -> set[str]:
-    """Resolved HERMES_WRITE_SAFE_ROOT paths (``os.pathsep``-separated list)."""
+    """Resolved HERMES_WRITE_SAFE_ROOT paths (``os.pathsep``-separated list),
+    read from the SERVING profile's own view.
+
+    Resolution (native scope primitives, no credential-policy detour):
+
+    * Not serving a routed profile (``serves_routed_profile()`` False — which
+      covers multiplex OFF and the launch profile's own home; the predicate,
+      not ``is_multiplex_active()``, because desktop backends and per-profile
+      cron tickers route a foreign home with multiplex off): the plain
+      ``os.environ`` read, byte-compatible with the legacy standalone case.
+    * Bound secret scope: the profile's own value REPLACES the fallback for
+      that profile (never an intersection, never a union).
+    * Routed foreign home with no scope (desktop / per-profile cron ticker):
+      the served home's ``.env`` via the cached native tokenizer.
+    * Multiplex ON with no scope bound: FAIL CLOSED — ``get_secret_str``
+      raises ``UnscopedSecretError`` exactly as every native secret read does.
+      Suppressing it to borrow the launch home's ``.env`` / ``os.environ``
+      would police (or unjail) the turn under the wrong profile's ceiling.
+    * Missing OR blank/empty within a bound/routed view: retains the
+      process/deployment fallback (``os.environ``) so the deployment jail is
+      never silently dropped — a deliberate deviation from
+      ``cron/env_settings.cron_env_setting``, which has no ``os.environ``
+      fallback. Total absence everywhere leaves roots empty, i.e. unrestricted
+      by this guard (never a fail-closed empty jail) inside a VALID bound scope.
+    """
+    from agent.secret_scope import (
+        current_secret_scope, get_secret_str, is_multiplex_active,
+        load_env_file, serves_routed_profile,
+    )
+
+    name = "HERMES_WRITE_SAFE_ROOT"
+    if not serves_routed_profile():
+        raw = os.getenv(name, "")
+    else:
+        scope = current_secret_scope()
+        if scope is None:
+            if is_multiplex_active():
+                # Unbound under multiplex: native fail-closed (raises).
+                get_secret_str(name)
+            scope = load_env_file(_hermes_home_path() / ".env")
+        value = scope.get(name)
+        raw = os.getenv(name, "") if (value is None or not str(value).strip()) else str(value)
     roots: set[str] = set()
-    for path in filter(None, os.getenv("HERMES_WRITE_SAFE_ROOT", "").split(os.pathsep)):
+    for path in filter(None, raw.split(os.pathsep)):
         with suppress(OSError, ValueError):
             roots.add(os.path.realpath(os.path.expanduser(path)))
     return roots
