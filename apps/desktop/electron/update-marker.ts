@@ -356,9 +356,27 @@ export function cachedCreateTimeProbe(probe: CreateTimeProbe = processCreateTime
   }
 }
 
-/** This process's creation time without a spawn when Electron can tell it (plain Node probes). */
+let ownCreateTimeMemo: number | null = null
+
+/**
+ * This process's creation time without a spawn when Electron can tell it. Plain
+ * Node (tests, tooling) on Windows falls through to a blocking powershell CIM
+ * query, and the repair-lock poll asks every tick, so the answer is kept: the
+ * creation time of the running process cannot change. Only a successful read is
+ * kept; a transient failure is retried on the next call.
+ */
 export function ownCreateTimeSync(): number | null {
-  return ownCreateTime() ?? processCreateTimeSync(process.pid)
+  if (ownCreateTimeMemo !== null) {
+    return ownCreateTimeMemo
+  }
+
+  const ct = ownCreateTime() ?? processCreateTimeSync(process.pid)
+
+  if (ct !== null) {
+    ownCreateTimeMemo = ct
+  }
+
+  return ct
 }
 
 /**
