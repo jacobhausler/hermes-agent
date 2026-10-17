@@ -750,6 +750,7 @@ class GatewayStartupMixin:
         presentable reply stays marked and resumes."""
         from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
         ledger_on = await asyncio.to_thread(ledger_enabled)
+        from gateway.run_turn import _self_posted_since
         cutoff = time.time() - max_age_seconds  # older markers are cleared, never acted on
         with self.session_store._lock:
             self.session_store._ensure_loaded_locked()
@@ -764,8 +765,13 @@ class GatewayStartupMixin:
             started = started_at.timestamp()  # aware UTC marker; a pre-upgrade naive one reads as local
             if started < cutoff:
                 continue
+            # Live-delivery parity: a bare marker on a thread the bot answered out-of-band is
+            # settled as silence, not owed a warning — same probe the live path runs.
+            self_answered = await _self_posted_since(
+                self._adapter_for_source(origin),
+                getattr(origin, "chat_id", None), getattr(origin, "thread_id", None), started)
             text = self._crash_left_reply(await self.async_session_store.load_transcript(session_id),
-                                          started, origin)
+                                          started, origin, self_posted_since=self_answered)
             if text is None or (text and not ledger_on):
                 continue  # no final reply to deliver: the turn resumes
             if text:
@@ -778,12 +784,15 @@ class GatewayStartupMixin:
                 ledgered += 1
         return ledgered
 
-    def _crash_left_reply(self, history: list, started: float, origin) -> Optional[str]:
+    def _crash_left_reply(self, history: list, started: float, origin,
+                         self_posted_since: bool = False) -> Optional[str]:
         """What a crash-left turn owes, judged as live delivery would have: ``None`` when it never
         persisted a final reply after *started*; ``""`` when nothing would have been presented (a
         silence marker on a machinery turn or on a turn the adapter reported as not addressed to the
-        bot, a muted diagnostic wake); else the text to send, with any other bare silence marker
-        replaced by the same notice the live path sends."""
+        bot, a muted diagnostic wake, or a bare marker on a thread the bot already answered —
+        *self_posted_since*, resolved by the async caller from the adapter capability); else the
+        text to send, with any other bare silence marker replaced by the same notice the live
+        path sends."""
         from gateway.platforms.base import _strip_media_directives
         from gateway.response_filters import (
             is_intentional_silence_response, is_machinery_display_kind, silence_allowed,
@@ -810,7 +819,9 @@ class GatewayStartupMixin:
         if is_intentional_silence_response(last["content"]):
             silent_ok = silence_allowed(
                 prompt.get("display_kind"), (prompt.get("display_metadata") or {}).get("reply_expected"))
-            return "" if silent_ok else _unexpected_silence_reply()
+            if silent_ok or self_posted_since:
+                return ""
+            return _unexpected_silence_reply()
         return _strip_media_directives(_sanitize_gateway_final_response(origin.platform, last["content"])).strip() or None
 
     @staticmethod

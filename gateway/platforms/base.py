@@ -1892,6 +1892,13 @@ class BasePlatformAdapter(ABC):
         else:
             store.pop(str(chat_id), None)
 
+    async def has_self_post_since(self, chat_id: str, thread_id: Optional[str], since_ts: float) -> bool:
+        """True when this adapter can confirm a message IT delivered in this thread after
+        *since_ts* (epoch seconds). The gateway's unexpected-silence guard consults it: a turn
+        that answered out-of-band (proactive send, tool-delivered reply) must not get the
+        warning. Default False — adapters without history read-back keep the visible fallback."""
+        return False
+
     # Can wake a fresh turn AFTER a turn ends (detached-subagent completions); False for stateless
     # adapters (API server). Propagated to ``HERMES_SESSION_ASYNC_DELIVERY`` so tools never promise
     # a delivery they can't keep.

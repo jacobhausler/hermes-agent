@@ -66,16 +66,29 @@ class GatewayTurnPersistenceMixin:
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
         # silent; any other human one must not.
         from gateway.response_filters import is_machinery_display_kind, silence_allowed
-        from gateway.run_turn import _unexpected_silence_reply
+        from gateway.run_turn import _self_posted_since, _unexpected_silence_reply
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
         _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
         if _intentional_silence and not silence_allowed(_silence_kind, _silence_reply_expected):
-            logger.warning(
-                "silence marker rejected on a user turn: platform=%s chat=%s",
-                _platform_name, source.chat_id or "unknown",
-            )
-            _intentional_silence = False
-            response = _unexpected_silence_reply()
+            # The marker is only "unexpected" when nothing was delivered: when the adapter
+            # confirms a bot post in this thread newer than the trigger, the answer landed
+            # out-of-band and the marker reads as accepted silence, not a rejected one.
+            if await _self_posted_since(
+                self._adapter_for_source(source),
+                getattr(source, "chat_id", None), getattr(source, "thread_id", None),
+                _msg_start_time,
+            ):
+                logger.info(
+                    "silence marker accepted on a user turn: the bot already answered in-thread: platform=%s chat=%s",
+                    _platform_name, source.chat_id or "unknown",
+                )
+            else:
+                logger.warning(
+                    "silence marker rejected on a user turn: platform=%s chat=%s",
+                    _platform_name, source.chat_id or "unknown",
+                )
+                _intentional_silence = False
+                response = _unexpected_silence_reply()
         elif _intentional_silence and not is_machinery_display_kind(_silence_kind):
             logger.debug(
                 "silence marker suppressed on an unaddressed turn: platform=%s chat=%s",

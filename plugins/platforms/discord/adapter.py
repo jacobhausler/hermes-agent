@@ -5221,6 +5221,43 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         except (ValueError, TypeError):
             return 50
 
+    async def has_self_post_since(self, chat_id: str, thread_id: Optional[str], since_ts: float) -> bool:
+        """True when this bot posted a conversational message in the thread after *since_ts*.
+
+        Lets the gateway's unexpected-silence guard recognise a turn that answered out-of-band
+        (proactive send, tool-delivered reply). Status bumps and empty messages do not count.
+        Fails False on any gap so the visible fallback is kept when nothing can be confirmed.
+        """
+        client = self._client
+        bot_user = getattr(client, "user", None) if client is not None else None
+        channel_id = thread_id or chat_id
+        if bot_user is None or not channel_id or not since_ts:
+            return False
+        try:
+            cid = int(channel_id)
+            channel = client.get_channel(cid)
+            if channel is None:
+                channel = await client.fetch_channel(cid)
+            history = getattr(channel, "history", None)
+            if history is None:
+                return False
+            after = dt.datetime.fromtimestamp(float(since_ts), tz=dt.timezone.utc)
+            async for msg in history(limit=100, after=after, oldest_first=True):
+                if msg.author != bot_user:
+                    continue
+                content = getattr(msg, "clean_content", None) or getattr(msg, "content", "") or ""
+                if (
+                    str(getattr(msg, "id", "")) in self._nonconversational_messages
+                    or _looks_like_nonconversational_history_message(content)
+                ):
+                    continue
+                if not content.strip() and not getattr(msg, "attachments", None):
+                    continue
+                return True
+        except Exception as exc:
+            logger.debug("[%s] has_self_post_since probe failed for %s: %s", self.name, channel_id, exc)
+        return False
+
     async def _fetch_channel_context(
         self, channel: Any, before: DiscordMessage, reply_target: Optional[Any] = None,
     ) -> str:

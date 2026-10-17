@@ -90,6 +90,24 @@ def _unexpected_silence_reply() -> str:
     return t("gateway.errors.unexpected_silence")
 
 
+async def _self_posted_since(adapter: Any, chat_id: Any, thread_id: Any, since_ts: Any) -> bool:
+    """True only when the adapter's ``has_self_post_since`` capability confirms a bot-delivered
+    message in the same thread newer than *since_ts* (epoch seconds): the turn DID answer, just
+    out-of-band, so the unexpected-silence notice would accuse a delivered turn of silence.
+    Fails False on every gap — no adapter, no capability, missing timestamp, probe error — so a
+    failure with nothing delivered keeps the visible acknowledgement."""
+    if adapter is None or not since_ts:
+        return False
+    probe = getattr(adapter, "has_self_post_since", None)
+    if probe is None:
+        return False
+    try:
+        return bool(await probe(chat_id, thread_id, float(since_ts)))
+    except Exception as exc:
+        logger.debug("has_self_post_since probe failed for chat=%s: %s", chat_id, exc)
+        return False
+
+
 def _bg_prompt_preview(prompt: str, limit: int = 60) -> str:
     """Short single-line quote of a /bg prompt for its failure notice (the task id means nothing to the user)."""
     text = " ".join(str(prompt or "").split())
@@ -1799,12 +1817,27 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 )
                 first_response = ""
             else:
-                logger.warning(
-                    "Queued follow-up for session %s: replacing a human-turn silence marker.",
-                    session_key or "?",
-                )
-                first_response = _unexpected_silence_reply()
-                _already_streamed = False
+                # The marker is only "unexpected" when nothing was delivered: a bot post in
+                # this thread after the trigger means the answer landed out-of-band, and the
+                # warning would falsely accuse a delivered turn of silence.
+                if await _self_posted_since(
+                    adapter,
+                    getattr(turn_ctx.source, "chat_id", None),
+                    getattr(turn_ctx.source, "thread_id", None),
+                    getattr(turn_ctx, "persist_user_timestamp", None),
+                ):
+                    logger.info(
+                        "Queued follow-up for session %s: human-turn silence marker accepted — the bot already answered in-thread.",
+                        session_key or "?",
+                    )
+                    first_response = ""
+                else:
+                    logger.warning(
+                        "Queued follow-up for session %s: replacing a human-turn silence marker.",
+                        session_key or "?",
+                    )
+                    first_response = _unexpected_silence_reply()
+                    _already_streamed = False
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
         if first_response:
