@@ -779,8 +779,8 @@ class GatewayStartupMixin:
             started = started_at.timestamp()  # aware UTC marker; a pre-upgrade naive one reads as local
             if started < cutoff:
                 continue
-            text = self._crash_left_reply(await self.async_session_store.load_transcript(session_id),
-                                          started, origin)
+            text = await self._crash_left_reply(await self.async_session_store.load_transcript(session_id),
+                                                started, origin)
             if text is None or (text and not ledger_on):
                 continue  # no final reply to deliver: the turn resumes
             if text:
@@ -793,13 +793,20 @@ class GatewayStartupMixin:
                 ledgered += 1
         return ledgered
 
-    def _crash_left_reply(self, history: list, started: float, origin) -> Optional[str]:
+    async def _crash_left_reply(self, history: list, started: float, origin) -> Optional[str]:
         """What a crash-left turn owes, judged as live delivery would have: ``None`` when it never
         persisted a final reply after *started*; ``""`` when nothing would have been presented (a
         silence marker on a machinery turn or on a turn the adapter reported as not addressed to the
-        bot, a muted diagnostic wake); else the text to send, with any other bare silence marker
-        replaced by the same notice the live path sends."""
-        from gateway.platforms.base import _strip_media_directives
+        bot, a muted diagnostic wake, or a human-turn marker whose trigger was answered out-of-band
+        like the live path suppresses); else the text to send, with any other bare silence marker
+        replaced by the same notice the live path sends.
+
+        The out-of-band suppression consults the delivery adapter's optional
+        ``has_self_post_since`` receipt (``gateway.platforms.base.self_post_answered_since``).
+        Recovery often runs before that adapter has connected — the receipt then answers False and
+        the notice stands, the same fail-closed rule as the live path: an unproven delivery owes the
+        visible acknowledgement."""
+        from gateway.platforms.base import _strip_media_directives, self_post_answered_since
         from gateway.response_filters import (
             is_intentional_silence_response, is_machinery_display_kind, silence_allowed,
         )
@@ -825,7 +832,13 @@ class GatewayStartupMixin:
         if is_intentional_silence_response(last["content"]):
             silent_ok = silence_allowed(
                 prompt.get("display_kind"), (prompt.get("display_metadata") or {}).get("reply_expected"))
-            return "" if silent_ok else _unexpected_silence_reply()
+            if silent_ok:
+                return ""
+            if await self_post_answered_since(
+                self._delivery_adapter_for(origin), origin, after_ts=started,
+            ):
+                return ""  # answered out-of-band: live delivery would have suppressed the notice
+            return _unexpected_silence_reply()
         return _strip_media_directives(_sanitize_gateway_final_response(origin.platform, last["content"])).strip() or None
 
     @staticmethod
