@@ -23,7 +23,7 @@ from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
-from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
+from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome, self_post_answered_since
 from gateway.platforms.event import MessageEvent
 from gateway.response_filters import (
     display_kind_for_event, display_metadata_for_event, is_machinery_display_kind, reply_expected_metadata,
@@ -1783,6 +1783,19 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
+                    session_key or "?",
+                )
+                first_response = ""
+            elif await self_post_answered_since(
+                adapter, turn_ctx.source,
+                after_id=turn_ctx.inbound_message_id or None,
+                after_ts=getattr(turn_ctx, "persist_user_timestamp", None),
+            ):
+                # Out-of-band answer already landed in this thread (see the normal-lane twin in
+                # _hmwa_shape_agent_response): suppress the notice here too — queued-lane parity.
+                logger.info(
+                    "Queued follow-up for session %s: suppressing a human-turn silence marker; the "
+                    "trigger was answered out-of-band.",
                     session_key or "?",
                 )
                 first_response = ""

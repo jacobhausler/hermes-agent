@@ -39,6 +39,41 @@ def _consume_detached_handler_exception(task: asyncio.Task) -> None:
         logger.error("Detached fatal-error handler task failed: %s", exc, exc_info=exc)
 
 
+async def self_post_answered_since(adapter, source, *, after_id=None, after_ts=None) -> bool:
+    """Whether the bot already delivered its own post in *source*'s thread after the trigger.
+
+    The delivery receipt behind out-of-band answer suppression: a human turn that ends on a bare
+    silence marker still owes a visible notice, UNLESS the agent answered the same trigger through
+    another door (e.g. a CLI/API post into the same thread) while the display policy kept the turn
+    itself silent — then the warning would fire on an answered turn. Consults the optional adapter
+    capability ``has_self_post_since(chat_id=…, thread_id=…, after_id=…, after_ts=…)`` (adapters
+    answer True only on a positively-found bot-authored message newer than every supplied floor).
+
+    Fail-closed by construction: adapters without the capability, a source without a chat, a
+    missing floor, and any adapter error all answer False, so a turn that delivered nothing keeps
+    the notice. Callers treat True as "answered — suppress the notice", never as permission to
+    suppress on an unproven delivery.
+    """
+    check = getattr(adapter, "has_self_post_since", None)
+    if not callable(check):
+        return False
+    chat_id = getattr(source, "chat_id", None) or ""
+    if not chat_id or (after_id is None and after_ts is None):
+        return False
+    try:
+        verdict = check(
+            chat_id=chat_id, thread_id=getattr(source, "thread_id", None),
+            after_id=after_id, after_ts=after_ts,
+        )
+        if inspect.isawaitable(verdict):
+            verdict = await verdict
+        return bool(verdict)
+    except Exception:
+        logger.debug(
+            "has_self_post_since failed for chat %s; keeping the silence notice", chat_id, exc_info=True)
+        return False
+
+
 # Audio exts for native audio delivery; Telegram's narrower sets stay separate (.m2a is audio to
 # Hermes but not to sendAudio).
 _AUDIO_MIME_TYPES = {

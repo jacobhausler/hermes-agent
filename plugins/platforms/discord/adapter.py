@@ -2670,6 +2670,59 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             async for message in self._iter_channel_and_thread_messages(thread, limit=limit, after=after, seen_channels=seen_channels):
                 yield message
 
+    async def has_self_post_since(
+        self, *, chat_id: str, thread_id: Optional[str] = None,
+        after_id: Optional[str] = None, after_ts: Optional[float] = None,
+    ) -> bool:
+        """Delivery receipt for out-of-band answer suppression (``gateway.platforms.base.self_post_answered_since``).
+
+        True only when THIS bot authored a message in the trigger's own channel/thread newer than
+        every supplied floor — ``after_id`` (the trigger's snowflake) and/or ``after_ts`` (unix
+        epoch; the crash-recovery path has no message id). The scan is bounded (up to 100 posts,
+        floor used as a filter, never an early-exit — ``history(after=...)`` carries no
+        iteration-order guarantee) and order-agnostic, so a flooded thread or an ordering
+        surprise answers False, never True: every miss — unresolvable channel, disconnected
+        client, REST error — keeps the caller's silence notice visible rather than suppressing
+        on an unproven delivery.
+        """
+        bot_id = getattr(getattr(self._client, "user", None), "id", None)
+        if bot_id is None:
+            return False
+        floors: list[dt.datetime] = []
+        after_obj: Optional[Any] = None
+        if after_id is not None:
+            try:
+                after_obj = discord.Object(id=int(after_id))
+                floors.append(_discord_snowflake_time(int(after_id)))
+            except (TypeError, ValueError):
+                pass
+        if after_ts is not None:
+            try:
+                floors.append(dt.datetime.fromtimestamp(float(after_ts), tz=dt.UTC))
+            except (TypeError, ValueError, OSError, OverflowError):
+                pass
+        if not floors:
+            return False
+        try:
+            floor = max(floors)
+            channel = await self._resolve_channel(thread_id or chat_id)
+            history = getattr(channel, "history", None)
+            if not callable(history):
+                return False
+            # Bounded, order-agnostic scan: discord.py's history(after=...) has no iteration-order
+            # guarantee (the repo's own recovery backfill collects then re-sorts for exactly this
+            # reason), so the floor filters — it never breaks the loop — and limit bounds the work.
+            async for message in history(limit=100, after=after_obj, oldest_first=False):
+                created = getattr(message, "created_at", None)
+                if created is None or created <= floor:
+                    continue
+                if getattr(getattr(message, "author", None), "id", None) == bot_id:
+                    return True
+            return False
+        except Exception:
+            logger.debug("[%s] self-post receipt scan failed for channel %s", self.name, chat_id, exc_info=True)
+            return False
+
     def _discord_recovery_cursor(self, channel_id: str) -> Optional[str]:
         if not channel_id:
             return None
