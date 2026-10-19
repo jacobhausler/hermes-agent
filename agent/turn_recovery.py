@@ -1123,16 +1123,27 @@ def max_retries_exhausted_result(
     agent: Any, api_error: Exception, classified: Any, *, attempts: int, is_rate_limited: bool,
     error_msg: str, api_kwargs: Any, api_messages: Any, messages: list[dict[str, Any]],
     conversation_history: Any, api_call_count: int, approx_tokens: int, provider: Any,
-    base_url: Any, model: Any, delivered: str = "",
+    base_url: Any, model: Any, delivered: str = "", recovery_attempts: int = 0,
+    recovery_wall_s: float = 0.0,
 ) -> dict[str, Any]:
     """Terminal path once retries, transport recovery and fallback all failed: flush the
     trace, emit the billing / rate-limit / generic status, print stream-drop or thinking-timeout
     guidance (the latter wins), persist, build the result with ``failure_reason`` /
-    ``failure_retryable`` / ``billing_block``."""
+    ``failure_retryable`` / ``billing_block``.
+
+    ``recovery_attempts`` / ``recovery_wall_s`` are the turn-wide true totals across ALL
+    auto-recovery cycles (set by ``turn_api_error`` from ``agent._recovery_totals``); when set
+    the banner and chat copy report them instead of the last cycle's ``attempts``."""
     # Result/guidance helpers stay in the loop module (tests import + patch them there).
     from agent.conversation_loop import (
         _billing_block_dict, _billing_or_entitlement_message, _billing_terminal_label,
         _print_billing_or_entitlement_guidance,
+    )
+
+    if recovery_attempts:
+        attempts = max(int(recovery_attempts), attempts)
+    _wall_note = (
+        f" over {recovery_wall_s:.1f}s" if recovery_attempts and recovery_wall_s > 0 else ""
     )
 
     agent._flush_status_buffer()
@@ -1158,10 +1169,10 @@ def max_retries_exhausted_result(
         _reset = reset_hint(api_error)
         agent._emit_diagnostic_status(
             f"❌ Rate limited after {attempts} {'attempt' if attempts == 1 else 'retries'} — {_final_summary}"
-            f"{f' (resets in {_reset})' if _reset else ''}"
+            f"{f' (resets in {_reset})' if _reset else ''}{_wall_note}"
         )
     else:
-        agent._emit_diagnostic_status(f"❌ API failed after {attempts} retries — {_final_summary}")
+        agent._emit_diagnostic_status(f"❌ API failed after {attempts} retries{_wall_note} — {_final_summary}")
     _vlines(agent, f"   💀 Final error: {_final_summary}")
     _welcome_hint = _welcome_tier_guidance(classified, model=model, in_chat=False)
     if _welcome_hint:
@@ -1216,6 +1227,11 @@ def max_retries_exhausted_result(
             classified.reason.value, label=provider_label_for(provider), attempts=attempts,
             summary=_final_summary, reset_seconds=_reset_at - time.time() if _reset_at else None,
         )
+        if _wall_note:
+            _final_response += (
+                f" The recovery loop kept re-trying it for {recovery_wall_s:.0f}s "
+                f"across all {attempts} attempts before giving up."
+            )
         if _welcome_hint:
             _final_response = _welcome_tier_guidance(classified, model=model, in_chat=True)
             _free_tier_kind = _welcome_surface_kind(classified)

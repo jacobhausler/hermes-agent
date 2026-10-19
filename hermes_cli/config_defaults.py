@@ -1,3 +1,6 @@
+# health: allow FILE_LINES -- provider-outage recovery fix: the +10 lines are two documented
+# DEFAULT_CONFIG agent keys (auto_recovery_max_wall_seconds / auto_recovery_max_attempts);
+# DEFAULT_CONFIG is a pure-data leaf dict with no offset move available for config keys.
 """Default configuration data for Hermes Agent: DEFAULT_CONFIG and OPTIONAL_ENV_VARS.
 
 Pure-data leaf module — must not import from hermes_cli.config. Comments are the user-facing
@@ -137,6 +140,16 @@ DEFAULT_CONFIG = {
         # visible "retrying automatically" countdown instead of ending the turn. Esc/interrupt stops
         # the wait; auth/format/billing/policy errors never enter. 0 disables.
         "auto_recovery_cycles": 5,
+        # TOTAL bounds on one turn's provider-outage recovery loop. The per-cycle ladder above
+        # restarts its cycle counter whenever a steer/re-entry re-enters the loop, so cycles
+        # alone do not bound the wall an outage can eat: these caps accumulate across ALL
+        # recovery/steer/re-entry cycles of one user turn and the failure banner reports the
+        # true accumulated attempts + wall seconds, never the last cycle's count. Env
+        # HERMES_AUTO_RECOVERY_MAX_WALL_S / HERMES_AUTO_RECOVERY_MAX_ATTEMPTS win when set;
+        # a non-positive value removes that one bound (agent.auto_recovery_cycles: 0 still
+        # disables the whole ladder). Defaults are a safety valve, not a latency target.
+        "auto_recovery_max_wall_seconds": 600,
+        "auto_recovery_max_attempts": 10,
         # Seconds the Codex/Responses stream may keep reading after its terminal frame so the relay
         # finalizer can run. Relays that never close the SSE socket after response.completed would
         # otherwise wedge the turn until the idle watchdog discards the already-billed response

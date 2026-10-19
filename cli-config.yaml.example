@@ -1264,6 +1264,18 @@ agent:
   # Set 0 to disable (default 5).
   # auto_recovery_cycles: 5
 
+  # TOTAL bounds on one turn's outage-recovery loop. The cycle counter above
+  # restarts whenever a steer/re-entry re-enters the retry loop, so cycles alone
+  # do not bound how long an outage can eat: these caps accumulate across ALL
+  # recovery/steer/re-entry cycles of one user turn, and the failure banner
+  # reports the true accumulated attempts + wall seconds, never the last cycle's
+  # count. Env HERMES_AUTO_RECOVERY_MAX_WALL_S / HERMES_AUTO_RECOVERY_MAX_ATTEMPTS
+  # win when set; a non-positive value removes that one bound (the 0 above still
+  # disables the whole ladder). Defaults are a safety valve, not a latency target
+  # (default 600 seconds / 10 attempts).
+  # auto_recovery_max_wall_seconds: 600
+  # auto_recovery_max_attempts: 10
+
   # After the agent edits code without fresh passing verification, nudge it to
   # verify before finishing. Off by default (false). Set true to force it on
   # everywhere, or "auto" for the surface-aware mode: on for interactive

@@ -1,3 +1,7 @@
+# health: allow FILE_LINES -- provider-outage recovery fix: the +16 lines are the parse block
+# for the two new auto_recovery_max_* keys inside _apply_agent_section, the same chokepoint
+# where auto_recovery_cycles is parsed; all new behaviour lives in
+# agent/turn_recovery_autorecover.py, none of it here.
 """Implementation of :meth:`AIAgent.__init__` as ``init_agent(agent, ...)``.
 
 ``init_agent`` is a thin, ordered orchestrator over ``_init_*`` / ``_build_*`` phase
@@ -1443,6 +1447,22 @@ def _apply_agent_section(agent, _agent_cfg):
         agent._auto_recovery_cycles = max(int(_agent_section.get("auto_recovery_cycles", 5)), 0)
     except (TypeError, ValueError):
         agent._auto_recovery_cycles = 5
+    # TOTAL bounds across all recovery/steer/re-entry cycles of one turn (same module). Env
+    # HERMES_AUTO_RECOVERY_MAX_WALL_S / HERMES_AUTO_RECOVERY_MAX_ATTEMPTS win when set; a
+    # non-positive value removes that bound. Unparseable input falls back to the default.
+    def _recovery_cap(cfg_key: str, env_key: str, default: float) -> float:
+        raw = os.getenv(env_key, _agent_section.get(cfg_key, default))
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return default
+    agent._auto_recovery_max_wall_s = _recovery_cap(
+        "auto_recovery_max_wall_seconds", "HERMES_AUTO_RECOVERY_MAX_WALL_S", 600.0)
+    agent._auto_recovery_max_attempts = _recovery_cap(
+        "auto_recovery_max_attempts", "HERMES_AUTO_RECOVERY_MAX_ATTEMPTS", 10.0)
+    # Per-turn ledger of recovery attempts/wall accumulated so far (None = no recovery yet);
+    # conversation_loop resets it per turn, the ladder owns the accumulation.
+    agent._recovery_totals = None
 
 
 def _positive_int(raw: Any, *, reject: tuple = ()) -> Optional[int]:

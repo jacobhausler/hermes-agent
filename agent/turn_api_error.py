@@ -387,20 +387,26 @@ def settle_unrecovered_error(
         # ladder park the turn on a transient outage instead of ending it (#85426, #107307).
         from agent.turn_recovery_autorecover import auto_recover_after_exhaustion
         _ladder = auto_recover_after_exhaustion(
-            agent, api_error, classified, _retry, messages=messages,
-            conversation_history=conversation_history, api_call_count=api_call_count,
+            agent, api_error, classified, _retry, attempts_this_cycle=attempts_made,
+            messages=messages, conversation_history=conversation_history, api_call_count=api_call_count,
         )
         if _ladder is not None:
             if _ladder["action"] == "continue":
                 retry_count = 0
             return _verdict(_ladder["action"], _ladder.get("result"))
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
+        # Once the ladder has run, the last cycle's count is not the truth: hand the terminal
+        # banner the turn-wide totals (steer/re-entry restarts included), never ``attempts_made``.
+        _rt = getattr(agent, "_recovery_totals", None)
+        _rt = _rt if isinstance(_rt, dict) else {}
         return _verdict("return", max_retries_exhausted_result(
             agent, api_error, classified, attempts=attempts_made, is_rate_limited=is_rate_limited,
             error_msg=error_msg, api_kwargs=api_kwargs, api_messages=api_messages,
             messages=messages, conversation_history=conversation_history,
             api_call_count=api_call_count, approx_tokens=approx_tokens, provider=_provider,
             base_url=_base, model=_model, delivered=_delivered,
+            recovery_attempts=int(_rt.get("attempts", 0) or 0),
+            recovery_wall_s=float(_rt.get("wall_s", 0.0) or 0.0),
         ))
 
     wait_time = compute_error_backoff(
