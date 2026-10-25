@@ -791,6 +791,44 @@ class GatewayAdapterLifecycleMixin:
             and _platform_has_bot_credential(platform, platform_config)
         )
 
+    def _delivery_only_secondary_entry(self, platform, platform_config, profile_home):
+        """Delivery-only contract for the secondary-profile scan: the registered *platform* entry
+        when it ships a ``standalone_sender_fn`` (``deliver=<platform>`` cron jobs work without a
+        live adapter) AND the entry's own subscribe gate fails under *profile_home*'s runtime
+        scope; None otherwise.
+
+        Why (est-rqxyx): for such platforms ``enabled: true`` on a secondary profile is load-bearing
+        for cron delivery — ``cron/scheduler_delivery.py`` refuses the target transport when the
+        block is absent or disabled — while the subscribe adapter is only what inbound needs. The
+        old shape treated the delivery flag as a bind request: creation returned None and the scan
+        re-WARNED on every config/.env re-scan (ntfy with a publish token but no scoped topic).
+        When this returns an entry the scan logs one INFO with the remedy instead.
+
+        Conservative on every boundary: unregistered or deferred-missing entries, built-ins, entries
+        without a standalone sender, entries whose deps a registered installer could still fix, and
+        probes that raise all return None so the normal create path and its diagnostics run
+        unchanged.
+        """
+        from gateway.platform_registry import platform_registry
+        from gateway.run import _profile_runtime_scope
+        entry = platform_registry.get(platform.value)
+        if entry is None or entry.standalone_sender_fn is None:
+            return None
+        try:
+            with _profile_runtime_scope(profile_home, hydrate_secrets=False):
+                if not entry.check_fn():
+                    # Deps are a different failure: with ensure_deps_fn the create path is the one
+                    # place the installer may run, and a dep-less platform is not a configured
+                    # delivery-only one. Without an installer, check_fn False is a hard block —
+                    # for these entries that is exactly the delivery-only signal (ntfy: the probe
+                    # is ``httpx + scoped subscribe topic``).
+                    return entry if entry.ensure_deps_fn is None else None
+                if entry.validate_config is not None and not entry.validate_config(platform_config):
+                    return entry
+        except Exception:
+            return None  # probe raised: leave diagnosis to create_adapter's own handlers
+        return None  # gates pass: the profile really does want inbound — build it
+
     async def _reconnect_failed_platform(self, platform, now: float) -> None:
         """One watcher pass for a queued platform: gate, attempt, and record the outcome."""
         from gateway.run import _dispose_unused_adapter, _platform_has_bot_credential
@@ -1293,6 +1331,21 @@ class GatewayAdapterLifecycleMixin:
                 logger.info(
                     "[MULTIPLEX] Profile '%s': %s is served by the default profile's listener at /p/%s/ — "
                     "not starting a second listener", profile_name, platform.value, profile_name,
+                )
+                continue
+            # Delivery-only contract: the enabled block may exist purely so cron deliver=<platform>
+            # resolves (scheduler delivery requires it); with the plugin's standalone sender wired
+            # and the subscribe gate unconfigured in THIS profile's scope, the bind attempt is
+            # spurious — one INFO with the remedy, not a WARNING every re-scan.
+            _delivery_only_entry = self._delivery_only_secondary_entry(
+                platform, platform_config, profile_home)
+            if _delivery_only_entry is not None:
+                _remedy = (", ".join(getattr(_delivery_only_entry, "required_env", ()) or ())
+                           or "the platform's subscribe config")
+                logger.info(
+                    "[MULTIPLEX] Profile '%s': %s is delivery-only here - cron delivery uses the plugin's "
+                    "standalone sender; skipping inbound bind (no subscribe gate pass in this profile's "
+                    "scope; set %s there to receive inbound)", profile_name, platform.value, _remedy,
                 )
                 continue
             adapter = None

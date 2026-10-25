@@ -1255,3 +1255,177 @@ class TestSecondarySkipsCredentiallessPlatforms:
         assert connected == 1
         assert created == [(Platform.SLACK, profile_cfg.platforms[Platform.SLACK])]
         assert Platform.SLACK in runner._profile_adapters["profile-b"]
+
+
+
+class TestSecondaryDeliveryOnlyContract:
+    """est-rqxyx: a plugin platform enabled only so cron ``deliver=<platform>`` resolves must not
+    be treated as an inbound-bind request by the secondary scan.
+
+    Registry contract: an entry that ships ``standalone_sender_fn`` can deliver without a live
+    adapter, so when the entry's own subscribe gate fails under the profile's scope the scan skips
+    creation with one INFO (remedy included) instead of WARNINGing ``adapter creation returned
+    None`` on every startup and every config/.env re-scan (the multiplex host logged five of those
+    per gateway window for a delivery-only ntfy block on a profile whose secret scope carries a
+    publish token but no subscribe topic). Platforms WITHOUT the sender contract keep warning.
+    """
+
+    _NAME = "deliverprobe"
+
+    def _entry(self, *, subscribe_ok, standalone=True, installer=None, validate=None):
+        from gateway.platform_registry import PlatformEntry
+
+        async def _standalone_send(pconfig, chat_id, message, **_kw):
+            return {"success": True, "message_id": "probe"}
+
+        return PlatformEntry(
+            name=self._NAME, label="Deliver Probe", adapter_factory=lambda cfg: None,
+            check_fn=lambda: subscribe_ok, validate_config=validate,
+            ensure_deps_fn=installer, required_env=["DELIVERPROBE_TOPIC"],
+            standalone_sender_fn=_standalone_send if standalone else None,
+        )
+
+    def _register(self, entry):
+        """Register for the test and guarantee the registry is left as found."""
+        from gateway.platform_registry import platform_registry
+
+        prev = platform_registry.get(entry.name)
+        platform_registry.register(entry)
+
+        def _restore():
+            platform_registry.unregister(entry.name)
+            if prev is not None:
+                platform_registry.register(prev)
+
+        return Platform(self._NAME), _restore
+
+    def _runner(self, monkeypatch, profile_cfg, *, create_result=None):
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._profile_adapters = {}
+        runner.adapters = {}
+        created = []
+
+        def fake_create(platform, platform_config):
+            created.append((platform, platform_config))
+            return create_result
+
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: profile_cfg)
+        monkeypatch.setattr(runner, "_create_adapter", fake_create)
+        monkeypatch.setattr(runner, "_configure_profile_adapter", lambda *a, **k: None)
+        monkeypatch.setattr(
+            runner, "_connect_initial_adapter_with_timeout", AsyncMock(return_value=True)
+        )
+        return runner, created
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "gate", ["check-fn-fail", "validate-config-fail"],
+        ids=["subscribe-env-missing", "subscribe-config-missing"],
+    )
+    async def test_delivery_only_secondary_skips_without_warning(
+        self, monkeypatch, tmp_path, caplog, gate
+    ):
+        """Enabled + standalone sender + failed subscribe gate (either probe) -> one INFO, no
+        WARNING, no creation attempt — the exact estate symptom (scoped NTFY_TOPIC absent)."""
+        entry = (
+            self._entry(subscribe_ok=False)
+            if gate == "check-fn-fail"
+            else self._entry(subscribe_ok=True, validate=lambda cfg: False)
+        )
+        platform, restore = self._register(entry)
+        try:
+            profile_cfg = GatewayConfig(multiplex_profiles=True)
+            profile_cfg.platforms = {platform: PlatformConfig(enabled=True)}
+            runner, created = self._runner(monkeypatch, profile_cfg, create_result=None)
+
+            with caplog.at_level(logging.INFO, logger="gateway.run"):
+                connected = await runner._start_one_profile_adapters("profile-b", tmp_path, {})
+
+            assert connected == 0
+            assert created == []  # the spurious creation attempt never happens
+            assert platform not in runner._profile_adapters.get("profile-b", {})
+            warnings = [
+                r.getMessage() for r in caplog.records
+                if r.levelno >= logging.WARNING and "returned None" in r.getMessage()
+            ]
+            assert warnings == []
+            infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+            assert any(
+                "delivery-only" in m and "profile-b" in m and self._NAME in m for m in infos
+            )
+            assert any("DELIVERPROBE_TOPIC" in m for m in infos)  # the remedy is named
+        finally:
+            restore()
+
+    @pytest.mark.asyncio
+    async def test_scoped_subscribe_gate_pass_still_builds(self, monkeypatch, tmp_path):
+        """The contract silences the bind attempt only while the gate fails: a profile that DID
+        configure a scoped subscribe topic still gets its adapter."""
+        platform, restore = self._register(self._entry(subscribe_ok=True))
+        try:
+            profile_cfg = GatewayConfig(multiplex_profiles=True)
+            profile_cfg.platforms = {platform: PlatformConfig(enabled=True)}
+            adapter = _FakeAdapter(token="x")
+            runner, created = self._runner(monkeypatch, profile_cfg, create_result=adapter)
+
+            connected = await runner._start_one_profile_adapters("profile-b", tmp_path, {})
+
+            assert created == [(platform, profile_cfg.platforms[platform])]
+            assert connected == 1
+            assert runner._profile_adapters["profile-b"][platform] is adapter
+        finally:
+            restore()
+
+    @pytest.mark.asyncio
+    async def test_platform_without_standalone_sender_still_warns(self, monkeypatch, tmp_path, caplog):
+        """No delivery-only contract without ``standalone_sender_fn``: the None-creation WARNING
+        stays for every other platform (a real misconfiguration must remain loud)."""
+        platform, restore = self._register(self._entry(subscribe_ok=False, standalone=False))
+        try:
+            profile_cfg = GatewayConfig(multiplex_profiles=True)
+            profile_cfg.platforms = {platform: PlatformConfig(enabled=True)}
+            runner, created = self._runner(monkeypatch, profile_cfg, create_result=None)
+
+            with caplog.at_level(logging.INFO, logger="gateway.run"):
+                connected = await runner._start_one_profile_adapters("profile-b", tmp_path, {})
+
+            assert connected == 0
+            assert created == [(platform, profile_cfg.platforms[platform])]
+            warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+            assert any("returned None" in m for m in warnings)
+        finally:
+            restore()
+
+    @pytest.mark.asyncio
+    async def test_entry_with_installer_reaches_create_path(self, monkeypatch, tmp_path):
+        """check_fn False + ensure_deps_fn set: creation must still run — create_adapter is the ONE
+        place the auto-installer may fire; deps-missing is not a delivery-only verdict."""
+        platform, restore = self._register(self._entry(subscribe_ok=False, installer=lambda: True))
+        try:
+            profile_cfg = GatewayConfig(multiplex_profiles=True)
+            profile_cfg.platforms = {platform: PlatformConfig(enabled=True)}
+            runner, created = self._runner(monkeypatch, profile_cfg, create_result=None)
+
+            await runner._start_one_profile_adapters("profile-b", tmp_path, {})
+
+            assert created == [(platform, profile_cfg.platforms[platform])]
+        finally:
+            restore()
+
+    def test_ntfy_plugin_ships_the_standalone_sender_contract(self):
+        """The estate case, pinned at the plugin seam: ntfy registers ``standalone_sender_fn`` +
+        ``cron_deliver_env_var``, which is what makes an enabled-but-topic-less ntfy block on a
+        secondary profile delivery-only rather than a bind failure."""
+        from plugins.platforms.ntfy import adapter as ntfy_adapter
+
+        captured: dict = {}
+
+        class _Ctx:
+            def register_platform(self, **kwargs):
+                captured.update(kwargs)
+
+        ntfy_adapter.register(_Ctx())
+        assert captured.get("standalone_sender_fn") is not None
+        assert captured.get("cron_deliver_env_var") == "NTFY_HOME_CHANNEL"
+        assert "NTFY_TOPIC" in (captured.get("required_env") or [])
