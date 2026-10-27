@@ -2245,7 +2245,9 @@ dependencies = [
     { name = "httpx", extra = ["socks"] },
     { name = "jinja2" },
     { name = "markdown" },
+    { name = "nats-py" },
     { name = "nemo-relay", marker = "(platform_machine == 'aarch64' and 'android' not in platform_release and sys_platform == 'linux') or (platform_machine == 'x86_64' and 'android' not in platform_release and sys_platform == 'linux') or (platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'ARM64' and sys_platform == 'win32')" },
+    { name = "nkeys" },
     { name = "openai" },
     { name = "packaging" },
     { name = "pathspec" },
@@ -2606,8 +2608,10 @@ requires-dist = [
     { name = "misaki", extras = ["en"], marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin' and extra == 'kittentts') or (platform_machine != 'ARM64' and sys_platform == 'win32' and extra == 'kittentts') or (sys_platform != 'darwin' and sys_platform != 'win32' and extra == 'kittentts')", git = "https://github.com/NousResearch/misaki.git?rev=f03fd2be7346952a83d3d4845c217fc7667f322d" },
     { name = "mistralai", marker = "extra == 'mistral'", specifier = "==2.4.8" },
     { name = "modal", marker = "extra == 'modal'", specifier = "==1.5.5" },
+    { name = "nats-py", marker = "python_full_version >= '3.14'", specifier = ">=2.7,<3" },
     { name = "nemo-relay", marker = "(python_full_version >= '3.14' and platform_machine == 'aarch64' and 'android' not in platform_release and sys_platform == 'linux') or (python_full_version >= '3.14' and platform_machine == 'x86_64' and 'android' not in platform_release and sys_platform == 'linux') or (python_full_version >= '3.14' and platform_machine == 'arm64' and sys_platform == 'darwin') or (python_full_version >= '3.14' and platform_machine == 'AMD64' and sys_platform == 'win32') or (python_full_version >= '3.14' and platform_machine == 'ARM64' and sys_platform == 'win32')", specifier = ">=0.10,<0.11" },
     { name = "neutts", extras = ["all"], marker = "python_full_version < '3.14' and extra == 'neutts'", specifier = "==1.4.1" },
+    { name = "nkeys", marker = "python_full_version >= '3.14'", specifier = ">=0.2.1,<0.4" },
     { name = "numpy", marker = "extra == 'audio-io'", specifier = "==2.4.3" },
     { name = "numpy", marker = "extra == 'voice'", specifier = "==2.4.3" },
     { name = "numpy", marker = "extra == 'wake'", specifier = "==2.4.3" },
@@ -3816,6 +3820,15 @@ wheels = [
 ]
 
 [[package]]
+name = "nats-py"
+version = "2.16.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2c/c8/739b72c9201081e48000884d476231873ac82f7247c43b33823eaf3c0bfb/nats_py-2.16.0.tar.gz", hash = "sha256:1d137ed7afc9b59033b3199324c6237df2016a5091935871344a787eba6b72fc", size = 79731, upload-time = "2026-09-16T07:47:21.843Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/48/a3/16cec37172144d3362d7551bb823a098b2b2903281fc095dfe4480b8c2fd/nats_py-2.16.0-py3-none-any.whl", hash = "sha256:aeb1ff123966c05833d26c7df7e1d54c1c6d32b612428b21677a2e921f1fecae", size = 93578, upload-time = "2026-09-16T07:47:20.799Z" },
+]
+
+[[package]]
 name = "nemo-relay"
 version = "0.10.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3847,6 +3860,15 @@ sdist = { url = "https://files.pythonhosted.org/packages/6a/51/63fe664f3908c97be
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9e/c9/b2622292ea83fbb4ec318f5b9ab867d0a28ab43c5717bb85b0a5f6b3b0a4/networkx-3.6.1-py3-none-any.whl", hash = "sha256:d47fbf302e7d9cbbb9e2555a0d267983d2aa476bac30e90dfbe5669bd57f3762", size = 2068504, upload-time = "2025-12-08T17:02:38.159Z" },
 ]
+
+[[package]]
+name = "nkeys"
+version = "0.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pynacl" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e1/8d/d17254baea57fe4a7dd1ba89827d3cf0a21106988ec8971a46bfc5239b15/nkeys-0.2.1.tar.gz", hash = "sha256:3a201dcd203d8bb05ba2884d441b2c92918b2a537a10d324e73738887dde9da3", size = 10667, upload-time = "2024-09-11T06:32:09.03Z" }
 
 [[package]]
 name = "num2words"

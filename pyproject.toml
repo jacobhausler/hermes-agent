@@ -216,7 +216,23 @@ dependencies = [
   # 738 CPython reports sys_platform == 'android' and never matched.) Pre-GKI
   # devices can still slip through; they get the same resolution failure as
   # before, worked around by installing with `--no-deps` or an older release.
-  "nemo-relay>=0.10,<0.11; ((sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64' and 'android' not in platform_release) or (sys_platform == 'linux' and platform_machine == 'aarch64' and 'android' not in platform_release) or (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'win32' and platform_machine == 'ARM64')) and python_version >= '3.14'",]
+  "nemo-relay>=0.10,<0.11; ((sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64' and 'android' not in platform_release) or (sys_platform == 'linux' and platform_machine == 'aarch64' and 'android' not in platform_release) or (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'win32' and platform_machine == 'ARM64')) and python_version >= '3.14'",
+  # NATS jetstream client for the gateway's event bus (the jetstream_* tools
+  # and the estate bus plugin). Baked into core so a bare `import nats` under
+  # the image venv is true and survives every venv rebuild — the vendor-overlay
+  # path (est-ob0f8) is out-of-band and silently re-opens the est-6dbof third
+  # prong on each rebuild (est-qeinq). Range, not an exact pin, under the
+  # written-justification clause: the estate close-gate fixes the bound itself
+  # (>=2.7,<3, the pm/AGENTS.md `>=floor,<next_major` shape) so image rebuilds
+  # pick up patch releases without a repo round-trip; 2.7.0 is the floor
+  # because that line carries the JetStream API parity the bus needs.
+  "nats-py>=2.7,<3; python_version >= '3.14'",
+  # nkeys signs NKEY credentials; nats-py lists it only under its [nkeys]
+  # extra, so declare it directly to keep signed connections installed
+  # regardless of how that extra's shape moves. Pre-1.0 upper bound is
+  # <0.(minor+2) per pm/AGENTS.md (floor 0.2.1 -> <0.4). Its pynacl
+  # dependency is already clamped by the [tool.uv] override above.
+  "nkeys>=0.2.1,<0.4; python_version >= '3.14'",]
 
 [project.optional-dependencies]
 # High-performance event loop — uvloop replaces the stdlib asyncio loop with
