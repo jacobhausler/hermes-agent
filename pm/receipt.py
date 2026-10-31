@@ -32,6 +32,14 @@ ITS OWN id (``last_for_update``), never latest.json — a sync that
 finished before the update began, a standalone sync, or one from a
 concurrent thread cannot be misattributed to it, and a nested update's
 sync never displaces the outer update's entry.
+
+Pointer kinds (UPD-4): ``finalize`` mirrors into the shared
+``latest.json`` (the newest receipt of ANY kind — the display surface
+for ``hermes pm status`` and the desktop). It is NOT an obligation
+surface: the updater's readers follow its own pointer
+(``latest-update.json``, written only by ``hermes_cli.update_receipt``),
+so a plugin-check or sync receipt can never displace an outstanding
+update obligation.
 """
 
 from __future__ import annotations

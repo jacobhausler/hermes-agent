@@ -257,14 +257,17 @@ def _latest_pointer(kind: str) -> str:
 
 
 def _payload_kind(payload: bytes) -> str:
-    """The receipt kind a pointer payload belongs to. Updater receipts carry ``kind='update'``;
-    a payload that predates the field came from this module, so it is an update receipt."""
+    """The receipt kind a pointer payload belongs to. Updater receipts carry ``kind='update'``
+    and always record ``argv``; a payload that predates the field came from this module, so it
+    is an update receipt. pm's own update-command receipt (``pm/cli.py``) also spells its kind
+    ``update`` but never records ``argv`` — on the shared display pointer it must not masquerade
+    as an update obligation, so it resolves to its own name and never discharges onto it."""
     with suppress(ValueError, UnicodeDecodeError):
         data = json.loads(payload.decode("utf-8-sig"))
         if isinstance(data, dict):
             kind = data.get("kind")
             if isinstance(kind, str) and kind:
-                return kind
+                return "pm-update" if kind == "update" and "argv" not in data else kind
     return "update"
 
 

@@ -67,7 +67,8 @@ command's own exit path and its atexit net do not run it again, and a resume the
 completion (`update_finish`) also records the failure as a follow-up and keeps its exit status.
 
 The receipt is durable while the run is open: `begin_update_receipt` writes it as
-`outcome: "running"` to the run's own archive file and `latest.json`, and each stage
+`outcome: "running"` to the run's own archive file and both latest pointers
+(`latest-update.json` and its shared `latest.json` mirror), and each stage
 boundary refreshes it, so a killed update leaves its own record. The next update marks a
 `running` record whose processes are gone `interrupted` (naming its last stage) and reports
 it. Receipts and the `update.log` tee resolve to the root home
