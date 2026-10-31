@@ -18,6 +18,7 @@ import pytest
 from hermes_cli.plugins_provenance import Provenance, ProvenanceClass
 from hermes_cli.plugins_updates import (
     CheckResult,
+    check_local_provenance,
     check_pip_plugins,
     check_provenanced,
     parse_feed_yml,
@@ -545,3 +546,182 @@ def test_default_fetch_follows_https_redirect(feed_redirect_server):
     base, visited = feed_redirect_server
     assert default_fetch(base + "/secure") == "version: 1.2.0\n"
     assert visited == ["/secure", "/feed"]
+
+
+# ── artifact-pinned (est-raqgj): proven, update_available from the catalog ──
+#
+# Sidecar row + install.json, no .git — the pack/atomic-installer lane.
+# The check never touches fetch/ls-remote (no feed, no git); the plugin
+# catalog answers. Both sidecar contract shapes are fixtures: the
+# richer archive shape and the 3-key {version, source_commit,
+# packaged_at} contract.
+
+_ARTIFACT_8KEY = {
+    "package": "hermes-workflows",
+    "version": "1.4.3",
+    "source_repo": "https://github.com/jacobhausler/hermes-workflows.git",
+    "source_commit": "911ab3f",
+    "merged_sha": "32cef07530a345db05a36e43f370bb5ffda1e3f6",
+    "artifact": "hermes-workflows-1.4.3.zip",
+    "artifact_sha256": "1c226a83d3224522d59df1d041c2f37b673f381a95d29aea2215596106987203",
+    "method": "INSTALL.md pack.py flow (ship lane wf-qa-remediation)",
+    "installed_at": "2026-10-28T03:20:32Z",
+}
+_ARTIFACT_3KEY = {
+    "version": "1.4.4",
+    "source_commit": "f6cf76afc87051848feddd3d868ee1812964486a",
+    "packaged_at": "2026-10-30T12:18:33-05:00",
+}
+_ARTIFACT_ROW = {
+    "pinned": True,
+    "revision": "9a6f8ac9963f38964f91c772a5f85e32259738ea",
+    "source": "https://github.com/jacobhausler/hermes-workflows.git",
+}
+
+
+def _entry(sha="b" * 40, version=""):
+    from hermes_cli.plugin_catalog import PluginCatalogEntry
+
+    return PluginCatalogEntry(
+        name="hermes-workflows",
+        repo="https://github.com/jacobhausler/hermes-workflows",
+        sha=sha,
+        description="d",
+        maintainer="m",
+        version=version,
+    )
+
+
+def _artifact_prov(install_json, **over):
+    over.setdefault("row", dict(_ARTIFACT_ROW))
+    return Provenance(
+        name=over.pop("name", "hermes-workflows"),
+        klass=ProvenanceClass.ARTIFACT,
+        path=Path("/x/hermes-workflows"),
+        install_json=install_json,
+        **over,
+    )
+
+
+def _fake_catalog(monkeypatch, entry):
+    monkeypatch.setattr("hermes_cli.plugin_catalog.find_removed", lambda _n: None)
+    monkeypatch.setattr(
+        "hermes_cli.plugin_catalog.get_live_catalog_entry", lambda _n: entry
+    )
+
+
+@pytest.mark.parametrize(
+    "install_json,version",
+    [(_ARTIFACT_8KEY, "1.4.3"), (_ARTIFACT_3KEY, "1.4.4")],
+    ids=["8key-archive", "3key-contract"],
+)
+def test_artifact_classifies_proven_and_catalog_newer_is_an_update(
+    monkeypatch, install_json, version
+):
+    _fake_catalog(monkeypatch, _entry(sha="d" * 40, version="9.9.9"))
+    r = check_provenanced(_artifact_prov(install_json), fetch=_no, ls_remote=_no)
+    assert r.klass == "proven"
+    assert r.current == version
+    assert r.latest == "9.9.9"
+    assert r.update_available is True
+    assert r.needs_fixing is None
+    # the remedy never suggests a git clone / reinstall
+    assert "clone" not in r.reason.lower()
+    assert "reinstall" not in r.reason.lower()
+    assert "artifact" in r.reason.lower()
+
+
+@pytest.mark.parametrize(
+    "install_json,version",
+    [(_ARTIFACT_8KEY, "1.4.3"), (_ARTIFACT_3KEY, "1.4.4")],
+    ids=["8key-archive", "3key-contract"],
+)
+def test_artifact_older_catalog_label_is_never_a_downgrade(
+    monkeypatch, install_json, version
+):
+    # the estate reality: catalog pin (and label) older than the
+    # installed artifact — provenance proven, verdict up-to-date
+    _fake_catalog(monkeypatch, _entry(sha="b" * 40, version="1.3.6"))
+    r = check_provenanced(_artifact_prov(install_json), fetch=_no, ls_remote=_no)
+    assert r.klass == "proven"
+    assert r.update_available is False
+    assert "clone" not in (r.reason or "").lower()
+
+
+def test_artifact_catalog_pin_equal_to_recorded_sha_is_up_to_date(monkeypatch):
+    # 3-key contract carries the FULL commit; an equal pin IS the artifact
+    # even when the catalog's version label is older — never a downgrade
+    _fake_catalog(monkeypatch, _entry(sha="f6cf76afc87051848feddd3d868ee1812964486a", version="1.0.0"))
+    r = check_provenanced(_artifact_prov(_ARTIFACT_3KEY), fetch=_no, ls_remote=_no)
+    assert r.klass == "proven"
+    assert r.update_available is False
+
+
+def test_artifact_short_source_commit_matches_catalog_pin_by_prefix(monkeypatch):
+    # the 8-key shape ships a short source_commit + full merged_sha
+    _fake_catalog(monkeypatch, _entry(sha="32cef07530a345db05a36e43f370bb5ffda1e3f6", version="1.4.3"))
+    r = check_provenanced(_artifact_prov(_ARTIFACT_8KEY), fetch=_no, ls_remote=_no)
+    assert r.klass == "proven"
+    assert r.update_available is False
+
+
+def test_artifact_uncomparable_pair_stays_unknown(monkeypatch):
+    # no catalog version label and a different pin: unknown, never True
+    _fake_catalog(monkeypatch, _entry(sha="d" * 40, version=""))
+    r = check_provenanced(_artifact_prov(_ARTIFACT_3KEY), fetch=_no, ls_remote=_no)
+    assert r.klass == "proven"
+    assert r.update_available is None
+    assert "clone" not in r.reason.lower()
+
+
+def test_artifact_missing_catalog_entry_names_the_archive_lane(monkeypatch):
+    _fake_catalog(monkeypatch, None)
+    r = check_provenanced(_artifact_prov(_ARTIFACT_8KEY), fetch=_no, ls_remote=_no)
+    assert r.klass == "proven"
+    assert r.update_available is None
+    assert "artifact-pinned" in r.reason
+    assert "clone" not in r.reason.lower()
+    # NOT the drift remedy
+    assert "reinstall from the recorded source" not in r.reason
+
+
+def test_artifact_removed_from_catalog(monkeypatch):
+    from hermes_cli.plugin_catalog import RemovedEntry
+
+    monkeypatch.setattr(
+        "hermes_cli.plugin_catalog.find_removed",
+        lambda _n: RemovedEntry(name="x", reason="deprecated by maintainer"),
+    )
+    r = check_provenanced(_artifact_prov(_ARTIFACT_8KEY), fetch=_no, ls_remote=_no)
+    assert r.klass == "proven"
+    assert "removed from catalog" in r.reason
+
+
+def test_artifact_local_provenance_is_good_standing():
+    r = check_local_provenance(_artifact_prov(_ARTIFACT_3KEY))
+    assert r.klass == "proven"
+    assert r.current == "1.4.4"
+    assert r.needs_fixing is None
+    assert "artifact-pinned" in r.reason
+
+
+def test_run_checks_classifies_archive_install_proven(tmp_path, monkeypatch):
+    """Fresh plugin-check receipt shape: run_checks over a dir mimicking
+    the estate install (sidecar row + install.json, no .git) — proven,
+    update_available computed from the catalog, zero git/feed contact."""
+    plugins = tmp_path / "plugins"
+    plugins.mkdir()
+    (plugins / ".install-metadata.json").write_text(
+        json.dumps({"hermes-workflows": dict(_ARTIFACT_ROW)}), encoding="utf-8"
+    )
+    target = plugins / "hermes-workflows"
+    target.mkdir()
+    (target / "plugin.yaml").write_text("name: hermes-workflows\n", encoding="utf-8")
+    (target / "install.json").write_text(json.dumps(_ARTIFACT_3KEY), encoding="utf-8")
+    _fake_catalog(monkeypatch, _entry(sha="e" * 40, version="9.9.9"))
+    results = run_checks(plugins, fetch=_no, ls_remote=_no, include_pip=False)
+    assert len(results) == 1
+    payload = results[0].to_json()
+    assert payload["class"] == "proven"
+    assert payload["update_available"] is True
+    assert payload["needs_fixing"] is None
