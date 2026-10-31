@@ -294,7 +294,8 @@ def _live_fleet_covers_receipt(expected_sha: str | None, receipt: dict, owed: se
 
 
 # A gateway the restart phase stopped without knowing its profile: no live row can be matched to it,
-# so only a live, current gateway of this checkout settles it, never an empty host (""=no profile).
+# so only the live fleet settles it — every local row current on the target code and at least one
+# local row running, never an empty host (""=no profile).
 _UNMAPPED_GATEWAY = ("gateway", "")
 
 
@@ -418,17 +419,19 @@ def _marker_only_restart_obsolete() -> bool:
     covered = _fleet_covered_gateways(fleet)
     if covered is None:
         return False  # unidentified runtime: the matrix cannot vouch for it
-    for row in fleet:
-        if row_is_external(row):
-            continue
+    local_rows = [row for row in fleet if not row_is_external(row)]
+    for row in local_rows:
         if row.get("state") != "current" or str(row.get("code_sha")) != target_sha:
             return False  # stale / down / unknown-identity row still owes the restart
     if owed is not None and not owed - {_UNMAPPED_GATEWAY} <= covered:
         return False  # A gateway this marker owns is absent (down) or unidentifiable.
-    if owed and _UNMAPPED_GATEWAY in owed and not (_fleet_covered_gateways(
-            [row for row in fleet if not row_is_external(row)]) or set()) - owed:
-        # An unmapped stopped gateway has no identity to match, so only a local gateway that no
-        # mapped owed one explains can be its successor; another checkout's gateway never is.
+    if owed and _UNMAPPED_GATEWAY in owed and not (_fleet_covered_gateways(local_rows) or set()):
+        # An unmapped stopped gateway has no identity to match, so the live fleet settles it:
+        # some local gateway of THIS checkout must be running, current on the target code
+        # (the loop above proves every live row is). On a single-profile host the restarted
+        # gateway IS the shadow's successor — the former surplus-row requirement (a live row
+        # no mapped obligation explains) could never be met there and pinned the banner to a
+        # provably-false red (UPD-4 seat B). A host with nothing running proves nothing.
         return False
     _clear_fleet_restart_pending_marker()
     logger.debug(
@@ -449,6 +452,36 @@ def _receipt_restart_phase_completed(receipt: dict) -> str | None:
     return str(post_sha) if post_sha else None
 
 
+def _live_fleet_matches_pulled_code(receipt: dict) -> bool:
+    """True when the live fleet runs exactly the code ``receipt`` pulled, with nothing local left
+    outside that proof: at least one live local gateway row, every local row ``current`` at the
+    receipt's expected SHA.
+
+    The marker-less discharge for a receipt whose owed identities cannot be verified (a stopped
+    gateway recorded without its profile leaves ``_receipt_owed_gateways`` unverified, so the
+    identity-matched leg can never answer): the fleet running the pulled code on the host that
+    owes nothing else is the whole of the available evidence (UPD-4 seat B). A stale row, a
+    wrong SHA, or an empty host keeps the obligation standing.
+    """
+    from hermes_cli.update_receipt import collect_fleet_versions, row_is_external
+
+    expected = ((receipt.get("plan") or {}).get("expected_sha")
+                or (receipt.get("post_update") or {}).get("sha")
+                or _current_checkout_sha())
+    if not expected:
+        return False
+    try:
+        fleet = collect_fleet_versions()
+    except Exception:  # the probe swallows its own failures; this covers import-time anomalies
+        logger.debug("Could not probe the live fleet for the pulled-code discharge", exc_info=True)
+        return False
+    local_rows = [row for row in fleet if not row_is_external(row)]
+    if not local_rows:
+        return False
+    return all(row.get("state") == "current" and str(row.get("code_sha")) == str(expected)
+               for row in local_rows)
+
+
 def _pending_fleet_restart_needed(*, receipt: dict | None = None, pending_manual: list[dict] | None = None) -> bool:
     """Require identity-matched gateways at checkout HEAD for update catch-up."""
     from hermes_cli.update_cmd import _current_checkout_sha
@@ -465,6 +498,8 @@ def _pending_fleet_restart_needed(*, receipt: dict | None = None, pending_manual
     owed = _receipt_owed_gateways(receipt, pending_manual)
     if not _receipt_reports_stale_runtime(receipt):
         return False
+    if owed is None and _live_fleet_matches_pulled_code(receipt):
+        return False  # unverifiable owed set, marker absent: the live fleet is already on the pulled code
     return not _live_fleet_covers_receipt(_current_checkout_sha(), receipt, owed)
 
 
@@ -489,6 +524,8 @@ def _update_owes_fleet_restart(*, receipt: dict | None = None, pending_manual: l
     # the remedy this warning names) has nothing of the update left to owe either.
     if restarted_to and _live_fleet_covers_receipt(restarted_to, receipt, owed, accept_states=("current", "stale")):
         return False
+    if owed is None and _live_fleet_matches_pulled_code(receipt):
+        return False  # unverifiable owed set, marker absent: the live fleet is already on the pulled code
     return not _live_fleet_covers_receipt(_current_checkout_sha(), receipt, owed)
 
 
