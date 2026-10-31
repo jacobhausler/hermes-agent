@@ -176,10 +176,14 @@ def test_unmapped_stop_debt_survives_startup_until_a_current_gateway_runs(monkey
     assert not fleet._fleet_restart_obligation_armed()
 
 
-def test_unmapped_stop_debt_is_not_settled_by_the_mapped_gateways_restart(monkeypatch, tmp_path):
-    # The inventory owes `default` AND an unmapped gateway: `default` coming back current is the
-    # successor of `default`, not of the unmapped one, so the debt stays until a further local
-    # gateway (the unmapped one's successor, whatever profile it names) runs the checkout.
+def test_unmapped_stop_debt_settles_from_the_live_fleet_on_the_restarted_gateway(monkeypatch, tmp_path):
+    # est-4fmxp (UPD-4 seat B) reverses the former surplus-row law: an unmapped shadow has no
+    # identity to match, so the live fleet settles it. The inventory owes `default` AND a shadow;
+    # `default` back live and current at the target code IS the successor the restart produced —
+    # the profile mapping was lost, the process is proven. The old law demanded a live row no
+    # mapped obligation explains, which a single-profile host can never present: the banner
+    # stayed a provably-false red forever. Fail-closed directions (stale row, empty host) are
+    # pinned in tests/hermes_cli/test_update_fleet_unmapped_discharge.py.
     from hermes_cli import update_cmd_fleet as fleet, update_host_obligation as host, update_receipt
 
     monkeypatch.setattr(host, "host_obligation_path", lambda: tmp_path / "host-update-restart.json")
@@ -191,10 +195,6 @@ def test_unmapped_stop_debt_is_not_settled_by_the_mapped_gateways_restart(monkey
     fleet_rows = [{"profile": "default", "state": "current", "code_sha": "head", "pid": 8}]
     monkeypatch.setattr(update_receipt, "collect_fleet_versions", lambda **kw: list(fleet_rows))
 
-    assert fleet._update_owes_fleet_restart(receipt={}, pending_manual=[]) is True
-    assert fleet._fleet_restart_obligation_armed()
-
-    fleet_rows.append({"profile": "work", "state": "current", "code_sha": "head", "pid": 9})
     assert fleet._update_owes_fleet_restart(receipt={}, pending_manual=[]) is False
     assert not fleet._fleet_restart_obligation_armed()
 
@@ -234,7 +234,11 @@ def test_same_sha_retry_adds_newly_stopped_unmapped_debt_to_an_existing_inventor
     assert {"kind": "gateway", "profile": "default", "pid": 7} in rows  # earlier debt kept
     assert {"kind": "gateway", "profile": None, "pid": 7999, "stopped_unmapped": True} in rows
     fleet_rows[:] = [{"profile": "default", "state": "current", "code_sha": "head", "pid": 8}]
-    assert fleet._marker_only_restart_obsolete() is False  # `default`'s successor is not 7999's
-    assert fleet._fleet_restart_obligation_armed()
-    fleet_rows.append({"profile": "work", "state": "current", "code_sha": "head", "pid": 9})
+    # est-4fmxp (UPD-4 seat B) reverses the surplus-row law this test used to pin: on a host whose
+    # every live local gateway runs the target code, the restart-debt claim is false and the marker
+    # discharges even without a second row proving to be 7999's successor — a single-profile host
+    # can never present that row. The stopped-gateway notice stays durable where it is honest: the
+    # run's follow-up named the stopped PID, and a stale (not merely absent) gateway still blocks
+    # the discharge (test_synthetic_stale_gateway_still_warns).
     assert fleet._marker_only_restart_obsolete() is True
+    assert not fleet._fleet_restart_obligation_armed()
