@@ -31,6 +31,9 @@ _PROBE = textwrap.dedent("""
     Path('result.json').write_text(json.dumps({
         'update_id': update_id, 'pm_sees_update': pm_sees_update,
         'updater_sees_pm': (receipts.read_latest_receipt() or {}).get('kind'),
+        'shared_after_sync': json.loads((old / 'latest.json').read_text())['kind'],
+        'scoped_after_sync': (json.loads((old / 'latest-update.json').read_text())
+                              if (old / 'latest-update.json').is_file() else {}).get('kind'),
         'old_archive': (receipts.read_receipt_for_action('a' * 32) or {}).get('update_id'),
         'root_archives': [p.name for p in receipts._receipt_dir().glob('update_*.json')],
     }))
@@ -55,5 +58,9 @@ def test_named_profile_sees_update_and_pm_receipts_in_both_directions(tmp_path):
     # The updater still writes the root store the Desktop and hand-off scripts read.
     assert any(result["update_id"] in name for name in result["root_archives"])
     assert result["pm_sees_update"] == result["update_id"]  # `hermes -p foo pm status`
-    assert result["updater_sees_pm"] == "sync"  # read_latest_receipt() consumers
+    # est-4kc1i: a sync replacing the SHARED pointer no longer displaces the update
+    # obligation from the reader — the scoped per-kind pointer answers instead.
+    assert result["updater_sees_pm"] == "update"
+    assert result["shared_after_sync"] == "sync"  # the shared pointer still mirrors pm's newest
+    assert result["scoped_after_sync"] == "update"  # mirrored into the profile store too
     assert result["old_archive"] == "old"  # receipts written to the profile store before the move
