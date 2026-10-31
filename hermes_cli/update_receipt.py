@@ -148,6 +148,10 @@ class UpdateReceipt:
         self.data: dict[str, Any] = {
             "schema": 1, "started_at": _utc_now_iso(), "finished_at": None,
             "argv": list(sys.argv), "pid": os.getpid(),
+            # Receipt kind: the shared latest.json pointer holds receipts of every kind written
+            # into this store, and every reader of an UPDATE obligation needs to tell this run's
+            # receipts from a pm sync or plugin-check (kind-scoped pointers, ``_write_latest``).
+            "kind": "update",
             "outcome": "running",  # running | success | partial | failed
             "pre_update": _code_identity(), "post_update": {},
             "steps": [], "skips": [], "gateway_restart": {}, "fleet": [],
@@ -247,13 +251,43 @@ def _receipt_dirs() -> list[Path]:
     return [root] if profile.resolve() == root.resolve() else [root, profile]
 
 
-def _write_latest(payload: bytes) -> None:
-    """Replace ``latest.json`` in every store a reader of this home consults."""
+def _latest_pointer(kind: str) -> str:
+    """The kind-scoped pointer file name (``latest-update.json`` for update receipts)."""
+    return f"latest-{kind}.json"
+
+
+def _payload_kind(payload: bytes) -> str:
+    """The receipt kind a pointer payload belongs to. Updater receipts carry ``kind='update'``;
+    a payload that predates the field came from this module, so it is an update receipt."""
+    with suppress(ValueError, UnicodeDecodeError):
+        data = json.loads(payload.decode("utf-8-sig"))
+        if isinstance(data, dict):
+            kind = data.get("kind")
+            if isinstance(kind, str) and kind:
+                return kind
+    return "update"
+
+
+def _write_latest(payload: bytes, *, shared: bool = True) -> None:
+    """Replace every pointer a reader of this home consults for this payload's kind.
+
+    ``latest.json`` stays the newest receipt of ANY kind (the Desktop and ``pm status`` read
+    that one). Alongside it the payload is filed at the kind-scoped ``latest-<kind>.json``,
+    which only a writer of that kind touches: the plugin-check cadence replacing ``latest.json``
+    can no longer displace an update receipt that still owes a fleet restart, and the discharge
+    path (``settle_latest_receipt_fleet``) stays reachable (est-4kc1i). ``shared=False`` files
+    the payload on its kind pointer only — used by a settle, which is not the newest event in
+    the store and must not overwrite a newer receipt of another kind on the shared pointer.
+    """
     from hermes_cli.runtime_state import _atomic_bytes
 
+    names = (_latest_pointer(_payload_kind(payload)),)
+    if shared:
+        names = ("latest.json", *names)
     for directory in _receipt_dirs():
         directory.mkdir(parents=True, exist_ok=True)
-        _atomic_bytes(directory / "latest.json", payload)
+        for name in names:
+            _atomic_bytes(directory / name, payload)
 
 
 def _run_file(directory: Path, data: dict[str, Any]) -> Path:
@@ -948,7 +982,7 @@ def _prune_old_receipts(directory: Path) -> None:
 
 
 def settle_latest_receipt_fleet(fleet: list[dict[str, Any]], *, discharges) -> bool:
-    """Record on ``latest.json`` that the fleet it still reports as owed now serves the checkout.
+    """Record on the update receipt that the fleet it still reports as owed now serves the checkout.
 
     A failed receipt whose plan rows cannot be matched to a live gateway (unknown identity,
     pre-pull SHAs) keeps ``hermes update`` exiting 1 and every CLI start warning about mixed
@@ -956,13 +990,15 @@ def settle_latest_receipt_fleet(fleet: list[dict[str, Any]], *, discharges) -> b
     caller has just verified every live row is current at the checkout SHA; persisting that
     matrix as the receipt's post-restart ``fleet`` (and un-flagging ``gateway_restart``) is what
     lets the stale-runtime readers see the recovery. ``discharges(settled_receipt)`` decides on
-    the in-memory copy; ``latest.json`` is rewritten only when it answers True, so a catch-up
-    that still owes the restart leaves the receipt byte-identical. Only the ``latest.json`` pointer is
-    rewritten; the archived per-run file keeps the original outcome. Never raises.
+    the in-memory copy; the pointer is rewritten only when it answers True, so a catch-up
+    that still owes the restart leaves the receipt byte-identical. The receipt is read from the
+    update-kind pointer, so a plugin-check that has since replaced the shared ``latest.json``
+    cannot make this unreachable (est-4kc1i); the shared pointer is re-filed only when it still
+    points at the very receipt being settled — a settle is not the newest event in the store.
+    The archived per-run file keeps the original outcome. Never raises.
     """
     try:
-        path = _receipt_dir() / "latest.json"
-        receipt = json.loads(path.read_text(encoding="utf-8-sig"))
+        receipt = read_latest_receipt()
         if not isinstance(receipt, dict):
             return False
         receipt["fleet"] = list(fleet)
@@ -974,25 +1010,57 @@ def settle_latest_receipt_fleet(fleet: list[dict[str, Any]], *, discharges) -> b
         receipt["gateway_restart"] = gateway_restart
         if not discharges(receipt):
             return False
-        _write_latest((json.dumps(receipt, indent=2, default=str) + "\n").encode("utf-8"))
+        payload = (json.dumps(receipt, indent=2, default=str) + "\n").encode("utf-8")
+        _write_latest(payload, shared=_shared_pointer_is_this_run(str(receipt.get("update_id") or "")))
         return True
     except Exception as exc:
         logger.debug("Could not settle latest update receipt from the live fleet: %s", exc)
         return False
 
 
+def _shared_pointer_is_this_run(update_id: str) -> bool:
+    """True when some store's shared ``latest.json`` still points at ``update_id``."""
+    if not update_id:
+        return False
+    for directory in _receipt_dirs():
+        with suppress(OSError, ValueError, UnicodeDecodeError):
+            pointed = json.loads((directory / "latest.json").read_text(encoding="utf-8-sig"))
+            if isinstance(pointed, dict) and pointed.get("update_id") == update_id:
+                return True
+    return False
+
+
 def read_latest_receipt() -> Optional[dict[str, Any]]:
-    """Read the most recent update receipt, or None. Never raises."""
+    """Read the most recent update receipt, or None. Never raises.
+
+    The kind-scoped ``latest-update.json`` is preferred: the shared ``latest.json`` holds the
+    newest receipt of ANY kind, and a plugin-check or sync replacing it must not hide an
+    update receipt that still owes a fleet restart (est-4kc1i). With no scoped pointer yet —
+    a home whose last update predates per-kind filing — ``latest.json`` answers only when it
+    itself holds an update-kind receipt, exactly as before; a receipt of another kind is
+    ``None``, which every obligation reader already treats as "nothing owed".
+    """
     with suppress(Exception):
-        # The newest pointer wins (the root on a tie): the last writer of either store, exactly
-        # as when updater and pm shared one folder.
-        points = [d / "latest.json" for d in _receipt_dirs() if (d / "latest.json").is_file()]
+        points = [d / _latest_pointer("update") for d in _receipt_dirs()
+                  if (d / _latest_pointer("update")).is_file()]
+        if not points:
+            points = [d / "latest.json" for d in _receipt_dirs()
+                      if _pointer_is_update_kind(d / "latest.json")]
         if not points:
             return None
+        # The newest pointer wins (the root on a tie): the last writer of either store, exactly
+        # as when updater and pm shared one folder.
         path = max(points, key=lambda p: p.stat().st_mtime)
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
         return payload if isinstance(payload, dict) else None
     return None
+
+
+def _pointer_is_update_kind(path: Path) -> bool:
+    """True when ``path`` is a readable pointer holding an update-kind receipt (legacy fallback)."""
+    with suppress(OSError, ValueError, UnicodeDecodeError):
+        return _payload_kind(path.read_bytes()) == "update"
+    return False
 
 
 def read_receipt_for_action(action_id: str) -> Optional[dict[str, Any]]:
