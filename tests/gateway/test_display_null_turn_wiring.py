@@ -16,7 +16,15 @@ from gateway.run_turn_runner import TurnRunner
 
 
 def _wire(user_config):
-    """Run `_wire_turn_agent_callbacks` over minimal fakes; return the agent."""
+    """Run `_wire_turn_agent_callbacks` over minimal fakes; return the agent.
+
+    The fake ctx carries the same ``resolve_display_setting`` binding a real turn context
+    has (run_turn.py wires the real resolver), so the per-platform chain is exercised here,
+    not just the global read.
+    """
+    from gateway.display_config import resolve_display_setting
+    from gateway.config import Platform
+
     agent = types.SimpleNamespace()
     ctx = types.SimpleNamespace(
         progress_callback=None,
@@ -33,7 +41,8 @@ def _wire(user_config):
         _status_adapter=None,
         session_key="",
         user_config=user_config,
-        source=types.SimpleNamespace(platform="telegram"),
+        source=types.SimpleNamespace(platform=Platform.TELEGRAM),
+        resolve_display_setting=resolve_display_setting,
         mute_notification_reply=False,
         _thinking_enabled=False,
         agent_holder=[None],

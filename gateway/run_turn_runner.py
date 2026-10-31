@@ -1286,13 +1286,19 @@ class TurnRunner:
                 pdc = getattr(ctx._status_adapter, "_post_delivery_callbacks", None)
                 if pdc is not None:
                     pdc[ctx.session_key] = bg_release
-        # display.memory_notifications: off | on (generic "💾 Memory updated", default) | verbose.
-        # `display:` present-but-null yields None, not the {} default (same `or {}` guard as
-        # display_config.py / runtime_footer.py).
-        mem_notif = (ctx.user_config.get("display") or {}).get("memory_notifications")
+        # display.memory_notifications: off | on (generic "💾 Memory updated") | verbose, resolved
+        # through the canonical per-platform chain (display.platforms.<plat> → display → platform
+        # tier → global; discord tier defaults it off — a bot seat's guild/thread is a shared
+        # surface, est-2ek.1.922 intake). The global-only read here ignored the documented
+        # per-platform override, so a discord off sat on the config and the notice posted anyway.
+        # `display:` present-but-null yields None via the resolver's `or {}` guard.
+        mem_notif = ctx.resolve_display_setting(
+            ctx.user_config,
+            "cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value,
+            "memory_notifications", "on")
         if isinstance(mem_notif, bool):
             mem_notif = "on" if mem_notif else "off"
-        agent.memory_notifications = str(mem_notif).lower() if mem_notif else "on"
+        agent.memory_notifications = str(mem_notif).strip().lower() if mem_notif else "on"
         agent.clarify_callback = self._clarify_callback_sync
         # Thinking between tool calls is independent of tool_progress mode (Mattermost opts in
         # per platform so global scratch-text doesn't leak into threads).
