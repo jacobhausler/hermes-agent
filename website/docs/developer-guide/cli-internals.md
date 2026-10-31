@@ -66,7 +66,10 @@ it guards. `plan → snapshot → apply → restart-per-kind → verify → repo
   receipt is `partial` with a `user_action`, since nothing retries what only the user can re-apply
   (#122557).
 - **Report**: every run writes a machine-readable receipt to the ROOT home's
-  `logs/update_receipts/` (never a sticky profile's; `update.log` likewise) — `latest.json` pointer;
+  `logs/update_receipts/` (never a sticky profile's; `update.log` likewise) — `latest-update.json`
+  pointer (the updater's own; the obligation readers follow it, UPD-4), mirrored into the shared
+  `latest.json` display pointer (newest receipt of ANY kind — `pm` sync/plugin-check receipts mirror
+  it too, so it can never hide an update obligation);
   steps, skips WITH reasons, restart outcome, plan, fleet snapshot, `followups`. The receipt is on
   disk as `outcome: "running"` from the start and refreshed at each stage boundary; the next
   update marks a `running` record whose processes are gone `interrupted` and says so. Readers
