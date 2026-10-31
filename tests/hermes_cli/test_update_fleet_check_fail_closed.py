@@ -234,7 +234,11 @@ def test_same_sha_retry_adds_newly_stopped_unmapped_debt_to_an_existing_inventor
     assert {"kind": "gateway", "profile": "default", "pid": 7} in rows  # earlier debt kept
     assert {"kind": "gateway", "profile": None, "pid": 7999, "stopped_unmapped": True} in rows
     fleet_rows[:] = [{"profile": "default", "state": "current", "code_sha": "head", "pid": 8}]
-    assert fleet._marker_only_restart_obsolete() is False  # `default`'s successor is not 7999's
-    assert fleet._fleet_restart_obligation_armed()
-    fleet_rows.append({"profile": "work", "state": "current", "code_sha": "head", "pid": 9})
+    # est-4fmxp (UPD-4 seat B) reverses the surplus-row law this test used to pin: on a host whose
+    # every live local gateway runs the target code, the restart-debt claim is false and the marker
+    # discharges even without a second row proving to be 7999's successor — a single-profile host
+    # can never present that row. The stopped-gateway notice stays durable where it is honest: the
+    # run's follow-up named the stopped PID, and a stale (not merely absent) gateway still blocks
+    # the discharge (test_synthetic_stale_gateway_still_warns).
     assert fleet._marker_only_restart_obsolete() is True
+    assert not fleet._fleet_restart_obligation_armed()
