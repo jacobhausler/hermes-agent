@@ -350,6 +350,24 @@ def _discharge_gatewayless_marker(checkout_sha: str, expected_sha: str) -> bool:
     return True
 
 
+def _fleet_answers_pulled_code(receipt: dict, owed: set[tuple[str, str]] | None) -> bool:
+    """The marker-less pulled-code discharge for BOTH owed-set shapes (UPD-4 seat B, est-4fmxp).
+
+    With no marker armed, the banner's only claim is that some gateway still serves the code
+    the receipt's run replaced — a fleet wholly answering the SHA that run PULLED disproves
+    it, whatever HEAD has moved to since (#119367's doctrine held against the pull's own SHA).
+    An unverifiable owed set (`None`: a stopped gateway recorded without its profile) leaves
+    the fleet itself as the whole evidence — ``_live_fleet_matches_pulled_code``. A VERIFIED
+    owed set must also see every owed profile covered at that SHA, not merely a fleet that
+    happens to run it: a restarted gateway must not silence the debt of a profile still down.
+    """
+    if owed is None:
+        return _live_fleet_matches_pulled_code(receipt)
+    pulled_sha = _receipt_pulled_sha(receipt)
+    return bool(pulled_sha) and _live_fleet_covers_receipt(
+        pulled_sha, receipt, owed, accept_states=("current", "stale"))
+
+
 def _marker_only_restart_obsolete() -> bool:
     """Settle only the inventory stored with this marker's target SHA.
 
@@ -452,6 +470,13 @@ def _receipt_restart_phase_completed(receipt: dict) -> str | None:
     return str(post_sha) if post_sha else None
 
 
+def _receipt_pulled_sha(receipt: dict) -> str:
+    """The SHA the obligation was written against: the pull's expected SHA, else the receipt's
+    post-update identity; "" when the receipt names neither."""
+    return str(((receipt.get("plan") or {}).get("expected_sha")
+                or (receipt.get("post_update") or {}).get("sha")) or "")
+
+
 def _live_fleet_matches_pulled_code(receipt: dict) -> bool:
     """True when the live fleet runs exactly the code ``receipt`` pulled, with nothing local left
     outside that proof: at least one live local gateway row, every local row ``current`` at the
@@ -465,9 +490,7 @@ def _live_fleet_matches_pulled_code(receipt: dict) -> bool:
     """
     from hermes_cli.update_receipt import collect_fleet_versions, row_is_external
 
-    expected = ((receipt.get("plan") or {}).get("expected_sha")
-                or (receipt.get("post_update") or {}).get("sha")
-                or _current_checkout_sha())
+    expected = _receipt_pulled_sha(receipt) or _current_checkout_sha()
     if not expected:
         return False
     try:
@@ -498,8 +521,8 @@ def _pending_fleet_restart_needed(*, receipt: dict | None = None, pending_manual
     owed = _receipt_owed_gateways(receipt, pending_manual)
     if not _receipt_reports_stale_runtime(receipt):
         return False
-    if owed is None and _live_fleet_matches_pulled_code(receipt):
-        return False  # unverifiable owed set, marker absent: the live fleet is already on the pulled code
+    if _fleet_answers_pulled_code(receipt, owed):
+        return False  # marker absent: the live fleet already runs the code this receipt pulled
     return not _live_fleet_covers_receipt(_current_checkout_sha(), receipt, owed)
 
 
@@ -524,8 +547,8 @@ def _update_owes_fleet_restart(*, receipt: dict | None = None, pending_manual: l
     # the remedy this warning names) has nothing of the update left to owe either.
     if restarted_to and _live_fleet_covers_receipt(restarted_to, receipt, owed, accept_states=("current", "stale")):
         return False
-    if owed is None and _live_fleet_matches_pulled_code(receipt):
-        return False  # unverifiable owed set, marker absent: the live fleet is already on the pulled code
+    if _fleet_answers_pulled_code(receipt, owed):
+        return False  # marker absent: the live fleet already runs the code this receipt pulled
     return not _live_fleet_covers_receipt(_current_checkout_sha(), receipt, owed)
 
 
