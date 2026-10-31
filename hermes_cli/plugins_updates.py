@@ -6,6 +6,9 @@ Address resolution per plugin, in order, no derivation ever (settled
   2. manifest update_url differs from the saved tag (or appeared where
      none was saved) → NEEDS-FIXING: fetch refused, tag untouched
   3. no update_url anywhere + git row → git ls-remote vs revision
+  3b. artifact-pinned (row + install.json, no .git) → the plugin
+      catalog answers update_available; remedy is always the archive
+      lane, never a git re-clone
   4. neither → manual/unupdatable
 Plus the pip world, stateless: entry-point discovery → installed version
 vs PyPI latest. NEVER mutates anything — no pulls, no row writes, no
@@ -92,6 +95,17 @@ def check_local_provenance(prov: Provenance) -> CheckResult:
     if prov.klass is ProvenanceClass.MANUAL:
         result.reason = "no provenance; not auto-updatable"
         return result
+    if prov.klass is ProvenanceClass.ARTIFACT:
+        # installed from a signed archive by the pack lane: the
+        # install.json record IS the provenance — no reinstall is owed,
+        # and the check_provenanced catalog leg answers update_available.
+        install = prov.install_json or {}
+        result.current = install.get("version") or (prov.row or {}).get("revision") or None
+        result.reason = (
+            f"artifact-pinned @ {install.get('version') or 'unknown version'}; "
+            "updates answered by the plugin catalog / archive installer lane"
+        )
+        return result
     if prov.klass is ProvenanceClass.DRIFT:
         result.reason = (
             f"provenance drift — sidecar records {prov.row.get('source')!r} "
@@ -130,6 +144,68 @@ def check_local_provenance(prov: Provenance) -> CheckResult:
     return result
 
 
+def _artifact_commits(install: dict) -> list[str]:
+    """Lowercased hex commits the artifact record carries, full sha
+    first: ``merged_sha`` when present, else/then ``source_commit``
+    (short in older archive shapes, full in the 3-key contract)."""
+    out: list[str] = []
+    for key in ("merged_sha", "source_commit"):
+        value = install.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{7,40}", value.strip()):
+            out.append(value.strip().lower())
+    return out
+
+
+def _same_commit(a: str, b: str) -> bool:
+    """Same commit, tolerating a short-vs-full hex pair (a git prefix
+    denotes exactly one commit at this length)."""
+    return a == b or a.startswith(b) or b.startswith(a)
+
+
+def _artifact_vs_catalog(
+    result: CheckResult, prov: Provenance, entry: Any
+) -> CheckResult:
+    """update_available for an artifact-pinned install, answered by the
+    catalog like-for-like. A catalog pin equal to the artifact's recorded
+    commit IS the installed artifact — up to date. Otherwise the
+    catalog's release version label vs install.json's version, which
+    orders the pair: a catalog pin older than the installed artifact must
+    not read as an update (the receipt never advertises a downgrade), and
+    an uncomparable pair stays unknown, never evidence of an update."""
+    install = prov.install_json or {}
+    installed_version = install.get("version")
+    commits = _artifact_commits(install)
+    result.current = installed_version or (commits[0] if commits else None)
+    if entry.sha and any(_same_commit(entry.sha.lower(), c) for c in commits):
+        result.latest = entry.version or entry.sha
+        result.update_available = False
+        return result
+    if installed_version and entry.version:
+        newer = _version_is_newer(entry.version, installed_version)
+        if newer is not None:
+            result.latest = entry.version
+            result.update_available = newer
+            if newer:
+                result.reason = (
+                    "catalog publishes a newer release — update by installing the "
+                    "newer signed artifact or re-pinning the catalog entry"
+                )
+            return result
+        result.latest = entry.version
+        result.reason = (
+            f"cannot compare catalog version {entry.version!r} with artifact "
+            f"version {installed_version!r}"
+        )
+        return result
+    result.latest = entry.sha or entry.version or None
+    result.update_available = None
+    result.reason = (
+        "artifact-pinned; catalog entry carries no version label comparable "
+        "with the installed artifact record"
+    )
+    return result
+
+
 def check_provenanced(
     prov: Provenance,
     *,
@@ -140,11 +216,20 @@ def check_provenanced(
     row = prov.row or {}
     catalog_value = row.get("catalog")
     catalog: dict = catalog_value if isinstance(catalog_value, dict) else {}
+    is_artifact = prov.klass is ProvenanceClass.ARTIFACT
     catalog_name = catalog.get("name") or row.get("catalog_name")
+    if catalog_name is None and is_artifact:
+        # artifact installs carry no saved feed: the catalog IS the
+        # update channel, keyed by the plugin's own name
+        catalog_name = prov.name
     if catalog_name:
         from hermes_cli.plugin_catalog import find_removed, get_live_catalog_entry
 
-        result = CheckResult(name=prov.name, klass="catalog", current=row.get("revision"))
+        result = CheckResult(
+            name=prov.name,
+            klass=prov.klass.value if is_artifact else "catalog",
+            current=row.get("revision"),
+        )
         removed = None if row.get("allow_removed") is True else (
             find_removed(str(catalog_name))
             or find_removed(str(catalog.get("repo") or row.get("source", "")).split("#", 1)[0])
@@ -154,8 +239,15 @@ def check_provenanced(
             return result
         entry = get_live_catalog_entry(str(catalog_name))
         if entry is None:
-            result.reason = "catalog entry is unavailable; installed pin retained"
+            result.reason = (
+                "artifact-pinned; catalog entry is unavailable — the update lane is a "
+                "newer signed artifact (archive installer), never a reinstall"
+                if is_artifact else
+                "catalog entry is unavailable; installed pin retained"
+            )
             return result
+        if is_artifact:
+            return _artifact_vs_catalog(result, prov, entry)
         result.latest = entry.sha
         result.update_available = result.current != entry.sha
         return result
