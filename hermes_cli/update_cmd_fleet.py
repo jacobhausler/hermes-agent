@@ -349,6 +349,36 @@ def _discharge_gatewayless_marker(checkout_sha: str, expected_sha: str) -> bool:
     return True
 
 
+def _unmapped_shadows_gone(inventory: object) -> bool:
+    """True when every stopped-unmapped shadow row's pid is PROVABLY gone (UPD-4 seat B).
+
+    The single-profile settle evidence for an unmapped row: it names a process the restart
+    phase SIGTERM'd without learning its profile, so when the live fleet is wholly current at
+    the target SHA (the caller's gate) the only evidence that could still stand is the process
+    itself — a dead pid leaves no mixed-module risk, and its slot is demonstrably superseded.
+    A shadow row without a usable pid, a live pid, or an undecidable liveness answer keeps the
+    marker fail-closed; an inventory with no shadow rows at all answers False (there is nothing
+    for this settle to have proven — the caller only asks when it owes a shadow).
+    """
+    from hermes_cli.process_identity import _pid_alive_matches
+
+    if not isinstance(inventory, dict) or inventory.get("version") != 1:
+        return False
+    runtimes = inventory.get("runtimes")
+    if not isinstance(runtimes, list):
+        return False
+    seen = False
+    for runtime in runtimes:
+        if (not isinstance(runtime, dict) or runtime.get("kind") != "gateway"
+                or not runtime.get("stopped_unmapped")):
+            continue
+        pid = runtime.get("pid")
+        if type(pid) is not int or pid <= 0 or _pid_alive_matches(pid, None) is not False:
+            return False
+        seen = True
+    return seen
+
+
 def _marker_only_restart_obsolete() -> bool:
     """Settle only the inventory stored with this marker's target SHA.
 
@@ -383,7 +413,8 @@ def _marker_only_restart_obsolete() -> bool:
         if fields is None:
             return False
         expected_sha = fields.get("expected_sha", "").strip()
-        owed = _marker_owed_gateways(json.loads(fields.get("inventory", "null")))
+        inventory = json.loads(fields.get("inventory", "null"))
+        owed = _marker_owed_gateways(inventory)
     except (OSError, UnicodeError, ValueError):
         return False
     if owed is not None and not owed:
@@ -425,11 +456,17 @@ def _marker_only_restart_obsolete() -> bool:
             return False  # stale / down / unknown-identity row still owes the restart
     if owed is not None and not owed - {_UNMAPPED_GATEWAY} <= covered:
         return False  # A gateway this marker owns is absent (down) or unidentifiable.
-    if owed and _UNMAPPED_GATEWAY in owed and not (_fleet_covered_gateways(
-            [row for row in fleet if not row_is_external(row)]) or set()) - owed:
-        # An unmapped stopped gateway has no identity to match, so only a local gateway that no
-        # mapped owed one explains can be its successor; another checkout's gateway never is.
-        return False
+    local_covered = _fleet_covered_gateways([row for row in fleet if not row_is_external(row)]) or set()
+    if owed and _UNMAPPED_GATEWAY in owed and not local_covered - owed:
+        # An unmapped stopped gateway has no identity to match, so a local gateway that no
+        # mapped owed one explains is its successor; another checkout's gateway never is.
+        # The single-profile shape (UPD-4 seat B): the successor can only be a gateway the
+        # mapped owed set already names — settle the shadow rows from the live fleet itself.
+        # Every row above already proved itself current at the target SHA and every mapped
+        # owed gateway is covered; what remains is the stopped process, which must be
+        # provably gone (a live or unreadable pid keeps the marker fail-closed).
+        if not local_covered or not _unmapped_shadows_gone(inventory):
+            return False
     _clear_fleet_restart_pending_marker()
     logger.debug(
         "Fleet-restart-pending marker discharged: %d gateway(s) already serve %s",
@@ -488,6 +525,17 @@ def _update_owes_fleet_restart(*, receipt: dict | None = None, pending_manual: l
     # A fleet an operator has since restarted onto a moved checkout (``hermes gateway restart`` —
     # the remedy this warning names) has nothing of the update left to owe either.
     if restarted_to and _live_fleet_covers_receipt(restarted_to, receipt, owed, accept_states=("current", "stale")):
+        return False
+    # UPD-4 seat B, reader half: with no marker armed, the only claim this warning can be
+    # making is that some gateway still serves the code this run replaced. When the live fleet
+    # answers the SHA the update actually PULLED, that claim is disproven even though the
+    # restart-phase bookkeeping stayed incomplete (the owed rows the shadow discharge settled)
+    # and even though HEAD has since moved — the fleet is held to the code the update pulled,
+    # not to a later checkout HEAD. Only an armed marker's own inventory may still stand
+    # against it, and the armed branch above owns that decision.
+    pulled_sha = str((receipt.get("post_update") or {}).get("sha") or "")
+    if pulled_sha and pulled_sha != restarted_to and _live_fleet_covers_receipt(
+            pulled_sha, receipt, owed, accept_states=("current", "stale")):
         return False
     return not _live_fleet_covers_receipt(_current_checkout_sha(), receipt, owed)
 

@@ -177,13 +177,17 @@ def test_unmapped_stop_debt_survives_startup_until_a_current_gateway_runs(monkey
 
 
 def test_unmapped_stop_debt_is_not_settled_by_the_mapped_gateways_restart(monkeypatch, tmp_path):
-    # The inventory owes `default` AND an unmapped gateway: `default` coming back current is the
-    # successor of `default`, not of the unmapped one, so the debt stays until a further local
-    # gateway (the unmapped one's successor, whatever profile it names) runs the checkout.
-    from hermes_cli import update_cmd_fleet as fleet, update_host_obligation as host, update_receipt
+    # The inventory owes `default` AND an unmapped gateway whose process is STILL ALIVE (or whose
+    # liveness cannot be decided): `default` coming back current is the successor of `default`,
+    # not of the unmapped one, so the debt stays until a further local gateway (the unmapped
+    # one's successor, whatever profile it names) runs the checkout (UPD-4 amends this doctrine
+    # only for a shadow pid PROVABLY gone — a live pre-pull process can never be discharged;
+    # the settle lives in tests/hermes_cli/test_update_fleet_shadow_settle.py).
+    from hermes_cli import process_identity, update_cmd_fleet as fleet, update_host_obligation as host, update_receipt
 
     monkeypatch.setattr(host, "host_obligation_path", lambda: tmp_path / "host-update-restart.json")
     monkeypatch.setattr(fleet, "_current_checkout_sha", lambda: "head")
+    monkeypatch.setattr(process_identity, "_pid_alive_matches", lambda *a: True)
     fleet._write_fleet_restart_pending_marker(expected_sha="head", runtimes=[
         {"kind": "gateway", "profile": "default", "pid": 7},
         {"kind": "gateway", "profile": None, "pid": 101, "stopped_unmapped": True},
@@ -214,6 +218,9 @@ def test_same_sha_retry_adds_newly_stopped_unmapped_debt_to_an_existing_inventor
     monkeypatch.setattr("hermes_cli.update_cmd_maint._refresh_dashboard_after_update", lambda **kw: None)
     monkeypatch.setattr(update_cmd, "_surviving_pre_update_serve_runtimes", lambda plan: [])
     monkeypatch.setattr(fleet_verify, "_FLEET_PROBE_SETTLE_TIMEOUT_SECONDS", 0)  # A stays down: one poll
+    # The grown shadow is unexplained until a successor appears: pin it ALIVE (UPD-4 settles a
+    # shadow only on a provably-gone pid; the settle lives in test_update_fleet_shadow_settle.py).
+    monkeypatch.setattr("hermes_cli.process_identity._pid_alive_matches", lambda pid, *rest: pid == 7999)
     # Signal delivery is the external boundary: the down row has no process to drain.
     monkeypatch.setattr("hermes_cli.update_cmd_stale_survivors.signal_stale_fleet_survivors", lambda *a: None)
     fleet_rows = [{"profile": "default", "state": "down", "code_sha": "old", "pid": 7}]
