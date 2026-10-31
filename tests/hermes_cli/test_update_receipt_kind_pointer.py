@@ -163,3 +163,89 @@ class TestLegacyHomeFallback:
         _plugin_check_write()
         assert not (homed / "latest-update.json").exists()
         assert ur.read_latest_receipt() is None
+
+
+def _pm_write(kind: str, outcome: str = "failed", exit_code: int = 1):
+    """A pm receipt of ``kind`` through the real pm writer (its exact cadence/CLI path)."""
+    import pm.receipt as pm_receipt_mod
+
+    token = pm_receipt_mod.begin(kind)
+    path = pm_receipt_mod.finalize(outcome, exit_code, token=token)
+    assert path is not None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+class TestObligationSurvival:
+    """Folded contracts from the unit's second seat of the same defect (est-4kc1i): the
+    writer seam is pure for EVERY pm kind, the clobber does not leak into the amend path
+    or the manual-serve carry-forward chain, and pm's own ``update`` command kind never
+    masquerades as an update obligation on the shared pointer."""
+
+    @pytest.mark.parametrize("kind", ["plugin-check", "sync", "update"])
+    def test_no_pm_kind_reaches_the_scoped_pointer(self, homed, kind):
+        update_id = _owe_a_restart()
+        pm_receipt = _pm_write(kind)
+
+        assert ur.read_latest_receipt()["update_id"] == update_id
+        shared = json.loads((homed / "latest.json").read_text(encoding="utf-8"))
+        assert shared["kind"] == pm_receipt["kind"] == kind
+
+    def test_terminal_finalize_leaves_both_pointers_byte_identical(self, homed):
+        """No clobber between begin and finalize: the scoped pointer and the shared mirror
+        are the same terminal payload (a reader of either sees the same run)."""
+        _owe_a_restart()
+        assert (homed / "latest-update.json").read_bytes() == (homed / "latest.json").read_bytes()
+
+    def test_amended_followup_lands_on_the_obligation_after_a_clobber(self, homed):
+        """A post-finalize follow-up amends the UPDATE receipt even once the cadence owns
+        the shared pointer (the amend guard consults the scoped resolution)."""
+        update_id = _owe_a_restart()
+        _plugin_check_write()
+
+        ur.amend_terminal_followup(update_id, "build", "venv rebuild died")
+
+        read = ur.read_latest_receipt()
+        assert read["update_id"] == update_id
+        assert [f["step"] for f in read["followups"]] == ["build"]
+
+    def test_manual_serve_carry_forward_survives_a_clobber_between_runs(self, homed, monkeypatch):
+        """Begin's carry-forward snapshot reads the UPDATE receipt after a plugin-check moved
+        the shared pointer: the production chain (plan row -> carried at begin -> filed owed
+        at finalize) drops nothing."""
+        import hermes_cli.update_serve_obligations as serve_obligations
+
+        monkeypatch.setattr(serve_obligations, "defer_manual_serve", lambda runtime, **kw: False)
+        row = {"kind": "serve", "profile": "work", "supervisor": "manual-serve",
+               "restart_via": "respawn-argv", "pid": 900, "detail": {"create_time": 1000.0}}
+        ur.begin_update_receipt()
+        ur.record_fact("plan", {"runtimes": [row]})
+        ur.finalize_update_receipt("partial", fleet=[])
+        _plugin_check_write()
+
+        ur.begin_update_receipt()
+        assert ur.read_latest_receipt()["carried_manual_serves"] == [row]
+        ur.finalize_update_receipt("success", fleet=[])
+        assert ur.read_latest_receipt()["pending_manual_serves"] == [row]
+
+    def test_pm_update_command_kind_never_masquerades_on_the_shared_pointer(self, homed):
+        """A legacy home (no scoped pointer) whose shared pointer holds pm's own
+        ``update``-command receipt must read as NOTHING OWED: the kind spells ``update``
+        but only an updater receipt records ``argv``."""
+        _pm_write("update")
+        assert not (homed / "latest-update.json").exists()
+        assert ur.read_latest_receipt() is None
+
+    def test_settle_never_stamps_the_fleet_matrix_onto_a_pm_archive(self, homed):
+        """The discharge lands on the update receipt and its pointer only: no pm_*.json
+        archive — the plugin-check's or any other — absorbs a fleet matrix it never ran."""
+        _owe_a_restart()
+        _plugin_check_write()
+
+        assert ur.settle_latest_receipt_fleet(
+            [{"profile": "default", "pid": 2, "code_sha": "a" * 40, "state": "current"}],
+            discharges=lambda receipt: True,
+        ) is True
+        archives = list(homed.glob("pm_*.json"))
+        assert archives
+        for path in archives:
+            assert "fleet" not in json.loads(path.read_text(encoding="utf-8"))
