@@ -224,12 +224,18 @@ chown_hermes_tree() {
     # root-dropped file (`docker exec` defaults to uid 0 unless `-u` is
     # passed) cost minutes-to-hours per boot on multi-million-entry
     # profiles/ trees on HDD/sshfs-backed data volumes (the restart tax).
-    # Symlinks are skipped entirely — neither link nor referent is ever
-    # chowned through the link (the referent may live outside the target or
-    # be dangling), so bind-mounted host files keep their ownership under
-    # the same contract as issue #19788.
-    find "$target" \( ! -user hermes -o ! -group hermes \) ! -type l \
-        -exec chown hermes:hermes {} + 2>/dev/null || \
+    # Symlinks are never followed: `-execdir` runs chown from inside the
+    # directory find itself opened (no path re-resolution through a
+    # directory another process swapped for a symlink mid-scan) and
+    # `chown -h` re-owns a symlink itself, never its referent — the same
+    # per-entry semantics as the physical `chown -R` this replaces, so
+    # bind-mounted host files keep their ownership under the #19788
+    # contract and a hermes-uid process racing the boot (the serve
+    # container shares this volume) cannot redirect the root chown. GNU
+    # find refuses -execdir when PATH holds a relative entry; that fails
+    # closed into the warning below with nothing chowned.
+    find "$target" \( ! -user hermes -o ! -group hermes \) \
+        -execdir chown -h hermes:hermes {} + 2>/dev/null || \
         echo "[stage2] Warning: chown $target failed (rootless container?) — continuing"
 }
 

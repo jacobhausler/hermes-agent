@@ -47,15 +47,15 @@ CHOWN_SHIM = """#!/bin/sh
 if [ -n "$FAKE_CHOWN_LOG" ]; then
     printf chown >> "$FAKE_CHOWN_LOG"
     for a in "$@"; do printf ' %s' "$a" >> "$FAKE_CHOWN_LOG"; done
-    printf '\\n' >> "$FAKE_CHOWN_LOG"
+    printf ' @%s\\n' "$PWD" >> "$FAKE_CHOWN_LOG"
 fi
 exit ${FAKE_CHOWN_RC:-0}
 """
 
 # Records every invocation (blank-line-separated argv), then either hands
 # the call to the real find (mode=passthrough) or, in report mode, replays
-# the -exec batch over a canned offender list: one utility invocation per
-# listed path, mimicking `find ... -exec chown owner {} +`.
+# the -execdir batch over a canned offender list the way GNU find does:
+# from inside each offender's parent directory, naming it `./basename`.
 FIND_SHIM = """#!/bin/sh
 printf '\\n' >> "$FAKE_FIND_LOG"
 for a in "$@"; do printf '%s\\n' "$a" >> "$FAKE_FIND_LOG"; done
@@ -64,7 +64,7 @@ if [ "$FAKE_FIND_MODE" = passthrough ]; then
 fi
 state=pre; cmd=""; preargs=""
 for a in "$@"; do
-    if [ "$state" = pre ] && [ "$a" = "-exec" ]; then state=cmd; continue; fi
+    if [ "$state" = pre ] && [ "$a" = "-execdir" ]; then state=cmd; continue; fi
     if [ "$state" = cmd ]; then
         if [ "$a" = "{}" ]; then state=done; continue; fi
         if [ -z "$cmd" ]; then cmd=$a; else preargs="$preargs $a"; fi
@@ -75,7 +75,7 @@ if [ "$state" = done ] && [ -n "$FAKE_FIND_NAMES" ] && [ -f "$FAKE_FIND_NAMES" ]
     while IFS= read -r n; do
         [ -n "$n" ] || continue
         # word-split intentional: canned names carry no spaces.
-        $cmd $preargs "$n" || rc=${FAKE_FAIL_RC:-1}
+        (cd "$(dirname "$n")" && $cmd $preargs "./$(basename "$n")") || rc=${FAKE_FAIL_RC:-1}
     done < "$FAKE_FIND_NAMES"
 fi
 exit "$rc"
@@ -96,14 +96,19 @@ class Pass:
         find_rc: str = "0",
         fail_rc: str = "1",
         hermes_home: Path | None = None,
+        owner: tuple[str, str] | None = None,
+        real_chown: bool = False,
     ) -> None:
         shell = shutil.which("sh")
         if shell is None:
             pytest.skip("sh not available")
         real_find = _system_find()
+        if passthrough and real_find is None:
+            pytest.skip("GNU find required")
         bindir = tmp / "bin"
         bindir.mkdir(exist_ok=True)
-        for name, body in (("chown", CHOWN_SHIM), ("find", FIND_SHIM)):
+        shims = [("find", FIND_SHIM)] + ([] if real_chown else [("chown", CHOWN_SHIM)])
+        for name, body in shims:
             shim = bindir / name
             shim.write_text(body)
             shim.chmod(0o755)
@@ -112,11 +117,23 @@ class Pass:
         names = tmp / "offenders.txt"
         if offenders is not None:
             names.write_text("".join(f"{p}\n" for p in offenders))
+        region = _ownership_region(text)
+        if owner is not None:
+            # Real-find runs are judged against the invoking user so they
+            # hold on any CI runner, not only where the user is `hermes`.
+            user, group = owner
+            for literal in ("hermes:hermes", "-user hermes", "-group hermes"):
+                assert literal in region, f"harness: {literal!r} not found in region"
+            region = (
+                region.replace("hermes:hermes", f"{user}:{group}")
+                .replace("-user hermes", f"-user {user}")
+                .replace("-group hermes", f"-group {group}")
+            )
         self.script = tmp / "region.sh"
         self.script.write_text(
             "set -eu\n"
             f'HERMES_HOME="{hermes_home or target}"\n'
-            f"{_ownership_region(text)}\n"
+            f"{region}\n"
             f'chown_hermes_tree "{target}"\n'
         )
         self.shell = shell
@@ -156,25 +173,31 @@ class Pass:
         return [line for line in self.chown_log.read_text().splitlines() if line]
 
 def _system_find() -> str | None:
-    """Absolute GNU find, ignoring the not-yet-installed shims."""
-    for entry in (os.environ.get("PATH") or "").split(os.pathsep):
-        candidate = Path(entry) / "find" if entry else None
-        if candidate and candidate.is_file():
-            try:
-                out = subprocess.run(
-                    [str(candidate), "--version"],
-                    capture_output=True, text=True, timeout=10,
-                ).stdout
-            except OSError:
-                continue
-            if "GNU find" in out:
-                return str(candidate)
+    """Absolute GNU find (fixed system locations; never walks PATH)."""
+    for candidate in ("/usr/bin/find", "/bin/find", "/usr/local/bin/find"):
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            out = subprocess.run(
+                [candidate, "--version"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+        except OSError:
+            continue
+        if "GNU find" in out:
+            return candidate
     return None
 
 def _seed_tree(root: Path) -> None:
     (root / "sub").mkdir(parents=True)
     (root / "sub" / "healthy.txt").write_text("x")
     (root / "healthy.txt").write_text("x")
+
+def _invoking_owner() -> tuple[str, str]:
+    import grp
+    import pwd
+
+    return pwd.getpwuid(os.getuid()).pw_name, grp.getgrgid(os.getgid()).gr_name
 
 def _contains(hay: list[str], needle: list[str]) -> bool:
     return any(
@@ -190,6 +213,7 @@ def test_dirty_tree_chowns_only_the_reported_offenders(
 ) -> None:
     target = tmp_path / "profiles"
     _seed_tree(target)
+    (target / "rootdir").mkdir()
     offenders = [target / "sub" / "rootfile", target / "sub", target / "rootdir"]
     p = Pass(stage2_text, target, tmp_path, offenders=offenders)
 
@@ -201,12 +225,18 @@ def test_dirty_tree_chowns_only_the_reported_offenders(
     argv = invs[0]
     assert argv[0] == str(target)
     assert _contains(argv, ["(", "!", "-user", "hermes", "-o", "!", "-group", "hermes", ")"])
-    assert _contains(argv, ["!", "-type", "l"]), "symlinks must be excluded from the pass"
-    assert _contains(argv, ["-exec", "chown", "hermes:hermes", "{}", "+"])
+    # Race-safe form: chown runs from the directory find opened (-execdir)
+    # and never dereferences the final component (-h).
+    assert _contains(argv, ["-execdir", "chown", "-h", "hermes:hermes", "{}", "+"])
+    assert "-exec" not in argv, "plain -exec re-resolves full paths (symlink race)"
     assert "-R" not in argv
-    assert p.chown_calls() == [f"chown hermes:hermes {o}" for o in offenders]
+    assert p.chown_calls() == [
+        f"chown -h hermes:hermes ./rootfile @{target / 'sub'}",
+        f"chown -h hermes:hermes ./sub @{target}",
+        f"chown -h hermes:hermes ./rootdir @{target}",
+    ], p.chown_calls()
     # The healthy tree root is never chowned just because a file inside it is.
-    assert f"chown hermes:hermes {target}" not in p.chown_calls()
+    assert not any(c.startswith(f"chown -h hermes:hermes ./profiles @") for c in p.chown_calls())
 
 def test_healthy_tree_is_a_single_read_only_traversal(
     stage2_text: str, tmp_path: Path
@@ -215,7 +245,7 @@ def test_healthy_tree_is_a_single_read_only_traversal(
     # call chown zero times, and stay silent.
     target = tmp_path / "home"
     _seed_tree(target)
-    p = Pass(stage2_text, target, tmp_path, passthrough=True)
+    p = Pass(stage2_text, target, tmp_path, passthrough=True, owner=_invoking_owner())
 
     proc = p.run()
 
@@ -251,6 +281,23 @@ def test_find_failure_warns_and_boot_survives(
     assert proc.returncode == 0
     assert f"Warning: chown {target} failed" in proc.stdout
 
+def test_relative_path_entry_fails_closed_without_chowning(
+    stage2_text: str, tmp_path: Path
+) -> None:
+    # Real GNU find refuses -execdir when PATH carries a relative entry (a
+    # chown planted in the cwd would otherwise run as root). The pass must
+    # fail closed: warning, exit 0, chown never invoked.
+    target = tmp_path / "profiles"
+    _seed_tree(target)
+    p = Pass(stage2_text, target, tmp_path, passthrough=True, owner=_invoking_owner())
+    p.env["PATH"] = p.env["PATH"].replace(os.pathsep, f"{os.pathsep}.{os.pathsep}", 1)
+
+    proc = p.run()
+
+    assert proc.returncode == 0, proc.stderr
+    assert f"Warning: chown {target} failed" in proc.stdout
+    assert p.chown_calls() == []
+
 
 # --- #19788: nothing is ever chowned through a symlink ----------------------
 
@@ -264,7 +311,10 @@ def test_chown_helper_refuses_symlinked_directories(
         symlinked_home.symlink_to(real_home, target_is_directory=True)
     except (NotImplementedError, OSError):
         pytest.skip("directory symlinks are not available on this platform")
-    p = Pass(stage2_text, symlinked_home, tmp_path, passthrough=True)
+    p = Pass(
+        stage2_text, symlinked_home, tmp_path,
+        passthrough=True, owner=_invoking_owner(),
+    )
 
     proc = p.run()
 
@@ -285,7 +335,7 @@ def test_chown_helper_refuses_target_under_symlinked_home(
         pytest.skip("directory symlinks are not available on this platform")
     p = Pass(
         stage2_text, linked_home / "cron", tmp_path,
-        passthrough=True, hermes_home=linked_home,
+        passthrough=True, hermes_home=linked_home, owner=_invoking_owner(),
     )
 
     proc = p.run()
@@ -303,7 +353,10 @@ def test_real_root_owned_tree_repairs_offenders_only(
     leaves healthy entries, symlinks, and out-of-tree referents untouched."""
     import pwd
 
-    hermes = pwd.getpwnam("hermes")
+    try:
+        hermes = pwd.getpwnam("hermes")
+    except KeyError:
+        pytest.skip("no hermes user on this host")
     target = tmp_path / "profiles"
     _seed_tree(target)
     outside = tmp_path / "outside-referent"
@@ -319,7 +372,7 @@ def test_real_root_owned_tree_repairs_offenders_only(
     os.chown(target / "healthy.txt", hermes.pw_uid, hermes.pw_gid)
     healthy_ctime = (target / "healthy.txt").stat().st_ctime_ns
 
-    p = Pass(stage2_text, target, tmp_path, passthrough=True)
+    p = Pass(stage2_text, target, tmp_path, passthrough=True, real_chown=True)
     proc = p.run()
 
     assert proc.returncode == 0, proc.stderr
@@ -330,12 +383,13 @@ def test_real_root_owned_tree_repairs_offenders_only(
     # The healthy entry was never passed to chown: ctime unchanged.
     assert (target / "healthy.txt").stat().st_ctime_ns == healthy_ctime
     # Nothing was chowned through the symlink: the root-owned referent is
-    # still root's, the link itself (root-created) is still root's, and the
-    # dangling link neither failed the pass (no Warning above) nor appeared
-    # as an error on stderr.
+    # still root's while the (root-created) link itself was re-owned via
+    # `chown -h` — physical `chown -R` parity. The dangling link neither
+    # failed the pass (no Warning above) nor was dereferenced.
     assert (outside.stat().st_uid, outside.stat().st_gid) == (0, 0)
-    assert (target / "linkout").lstat().st_uid == 0
+    assert (target / "linkout").lstat().st_uid == hermes.pw_uid
     assert os.path.islink(target / "linkdangling")
+    assert (target / "linkdangling").lstat().st_uid == hermes.pw_uid
 
 
 # --- static structure: gates gone, anchors stable ---------------------------
@@ -349,8 +403,8 @@ def test_pre_scan_helper_is_gone_and_call_sites_ungated(stage2_text: str) -> Non
 def test_region_has_no_recursive_chown_invocation(stage2_text: str) -> None:
     code = _strip_comments(_ownership_region(stage2_text))
     assert "chown -R" not in code
-    assert "-exec chown" in code
-    assert "! -type l" in code
+    assert "-execdir chown -h hermes:hermes {} +" in code
+    assert "-exec chown" not in code
 
 def test_sibling_test_anchor_still_present(stage2_text: str) -> None:
     # tests/tools/test_stage2_hook_{api_server_keygen,nous_routing_env,
