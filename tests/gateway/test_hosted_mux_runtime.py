@@ -285,3 +285,51 @@ def test_startup_preserves_queued_work_until_ready(mux, monkeypatch):
     sid, = target.sessions
     admission, = list_session_admissions(target.db, session_id=sid, pending_only=False)
     assert admission['admission_id'] == executed[0] and admission['status'] == 'terminal'
+
+
+def test_hosted_ready_watcher_ticks_never_read_profile_files(mux, monkeypatch):
+    """A ready 1 Hz hosted-room watcher tick must not touch profile disk at all.
+
+    est-2ifxh (2026-11-03 wedge): every tick re-entered owner_scope and re-read each
+    served profile's .env on the event loop; under host I/O pressure that sync read
+    starved discord.py heartbeats and the shard zombied without reconnecting for 14 min.
+    """
+    import agent.secret_scope
+
+    runner, _, _, call = mux
+    call(runner._ensure_hosted_room_worker())
+    assert all(getattr(a, 'hosted_room_service', None) is not None
+               for a in runner.session_authorities)
+    reads = []
+    real_load = agent.secret_scope.load_env_file
+    monkeypatch.setattr(agent.secret_scope, 'load_env_file',
+                        lambda p: (reads.append(str(p)), real_load(p))[1])
+    call(runner._ensure_hosted_room_worker())
+    call(runner._ensure_hosted_room_worker())
+    assert reads == [], f'ready watcher ticks re-read profile .env files: {reads}'
+
+
+def test_hosted_first_build_reads_profile_files_off_the_event_loop(mux, monkeypatch):
+    """Even the build tick may not read profile files on the loop thread (est-2ifxh)."""
+    import threading
+
+    import agent.secret_scope
+
+    runner, _, loop, call = mux
+    reads = []
+    real_load = agent.secret_scope.load_env_file
+
+    def spy(path):
+        reads.append(threading.get_ident())
+        return real_load(path)
+
+    monkeypatch.setattr(agent.secret_scope, 'load_env_file', spy)
+
+    async def loop_ident():
+        return threading.get_ident()
+
+    on_loop = call(loop_ident())
+    call(runner._ensure_hosted_room_worker())
+    assert reads, 'the fixture profiles must be read at least once while building'
+    assert all(tid != on_loop for tid in reads), (
+        f'{len(reads)} profile .env reads ran on the event loop thread')

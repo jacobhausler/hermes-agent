@@ -5,7 +5,9 @@ from contextlib import nullcontext
 from pathlib import Path
 
 from gateway.session_contract import Principal
-from gateway.session_authorities import active_authority, all_authorities, owner_scope, serving_authorities
+from gateway.session_authorities import (
+    active_authority, all_authorities, async_owner_scope, serving_authorities,
+)
 from gateway.session_hosted_controls import HostedControls
 from gateway.owner_identity import same_owner
 from hermes_state_runtime import RuntimeStoreError, _epoch
@@ -256,7 +258,16 @@ async def ensure_hosted_service(runner):
 
 
 async def _ensure_hosted_service(runner, authority):
-    with owner_scope(authority):
+    # Steady state: once the service exists and its transport is installed there is no work
+    # left inside the scope, so skip it entirely. Entering the scope re-reads the profile's
+    # .env/config.yaml, and this runs from a 1 Hz watcher — that per-tick sync disk read
+    # starved discord.py heartbeats into a zombie shard under host I/O pressure (est-2ifxh).
+    service = getattr(authority, 'hosted_room_service', None)
+    if service is not None and getattr(service, '_transport_installed', False):
+        return
+    # Build path: read the profile's files in a worker thread, bind the scope on the loop
+    # (async_owner_scope keeps owner_scope's semantics, minus the loop-thread I/O).
+    async with async_owner_scope(authority):
         service = getattr(authority, 'hosted_room_service', None)
         if service is None:
             loop = asyncio.get_running_loop()
