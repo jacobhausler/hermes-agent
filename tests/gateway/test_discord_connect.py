@@ -938,6 +938,10 @@ async def test_skill_catalog_scan_runs_off_the_event_loop(monkeypatch):
         await asyncio.to_thread(scan_started.wait, 1)
         loop_ticked.set()
         await task
+        if getattr(adapter, "_slash_apply_task", None) is not None:
+            # est-pm8sg: connect() returns READY BEFORE the off-critical-path walk lands;
+            # the deferred task applies the catalog (skill entries included) to the tree.
+            await adapter._slash_apply_task
         return [n for n, _d, _k in adapter._skill_entries] == ["x"]
 
     assert await _scan_leaves_loop_free(adapter.connect)

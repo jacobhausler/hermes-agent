@@ -27,6 +27,7 @@ import time
 import traceback
 from collections import defaultdict
 from contextlib import nullcontext, suppress
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
 
@@ -202,6 +203,79 @@ def _native_slash_commands() -> tuple:
             for arg_name, arg_type, default, desc_key, choices in args)
         out.append((name, _text(description_key), localized_args, template, followup_key))
     return tuple(out)
+
+
+# ---------------------------------------------------------------------------
+# Slash-command catalog spec cache (est-pm8sg)
+# ---------------------------------------------------------------------------
+# The catalog walk reads config gates, plugin dirs and the skill catalog from disk. On the
+# 2026-11-03 disk-starvation episodes that walk took MINUTES and every reconnect attempt
+# paid for it BEFORE the Discord login: the 30s connect budget died with login never
+# started, the cancelled ``asyncio.to_thread`` could not stop the running thread, and the
+# stranded walks competed for the same starved disk they were waiting on (three finished
+# together at 17:38:01, two at 18:16:52). So now:
+#   * the last good spec is cached per profile home and reused across adapter instances —
+#     the connect budget never pays for a disk walk; and
+#   * a cold walk runs off the critical path under a single-flight lock — at most one walk
+#     thread exists per profile at any time, it is never cancelled, and the commands land
+#     after READY (acceptance alternative "build it after READY").
+# Runtime catalog mutations keep their existing refresh paths (reload_skills ->
+# refresh_skill_group); a spec older than the TTL is served stale while a background walk
+# refreshes it for the next connect.
+
+@dataclass(frozen=True)
+class SlashCommandSpec:
+    """Disk-resident half of the slash-command catalog, snapshotted for RAM-only rebuilds.
+
+    ``registry_entries``/``plugin_entries`` are ``(name, description, args_hint)`` tuples
+    already filtered for gateway availability; ``skill_entries`` are
+    ``(name, description, command_key)`` tuples in the stable alphabetical order autocomplete
+    expects (same contract as ``_refresh_skill_catalog_state``)."""
+
+    registry_entries: tuple[tuple[str, str, str], ...]
+    plugin_entries: tuple[tuple[str, str, str], ...]
+    skill_entries: tuple[tuple[str, str, str], ...]
+    skill_hidden: int
+    built_at: float
+
+
+_SLASH_SPEC_TTL_SECS = 600.0
+_SLASH_SPECS: dict[str, SlashCommandSpec] = {}
+_SLASH_SPEC_WALKING: set = set()
+_SLASH_SPEC_WAITERS: dict[str, list[tuple[Any, asyncio.Event]]] = {}
+_SLASH_SPEC_LOCK = threading.Lock()
+
+
+def _slash_spec_cache_key() -> str:
+    """Cache key for the slash-command spec: the HERMES home whose gates/plugins/skills the
+    walk reads (the owning profile's home under multiplex). Sharing one spec across profiles
+    would leak one profile's command gates and skill catalog into another."""
+    try:
+        from hermes_constants import get_hermes_home
+        return str(get_hermes_home())
+    except Exception:
+        return os.environ.get("HERMES_HOME", "")
+
+
+def _slash_spec_by_key(key: str) -> tuple[Optional[SlashCommandSpec], bool]:
+    """``(spec, stale)`` for ``key``. ``stale`` means older than the TTL: still serve it, but
+    kick a refresh so the next connect rebuilds the tree from a fresh catalog."""
+    with _SLASH_SPEC_LOCK:
+        spec = _SLASH_SPECS.get(key)
+        if spec is None:
+            return None, False
+        return spec, (time.monotonic() - spec.built_at) > _SLASH_SPEC_TTL_SECS
+
+
+def _slash_spec_cached() -> tuple[Optional[SlashCommandSpec], bool]:
+    return _slash_spec_by_key(_slash_spec_cache_key())
+
+
+def _slash_spec_set_event(event: asyncio.Event) -> None:
+    try:
+        event.set()
+    except Exception:  # pragma: no cover - defensive: loop already closed mid-callback
+        pass
 
 
 _DISCORD_SELECT_FIELD_LIMIT = 100
@@ -1251,6 +1325,18 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         super().__init__(config, Platform.DISCORD)
         self._client: Optional[commands.Bot] = None
         self._ready_event = asyncio.Event()
+        # Slash-command catalog walk state (est-pm8sg): the walk runs off the connect
+        # critical path; ``_slash_walk_done`` fires when the spec lands and the deferred
+        # task applies it to the live tree after READY. ``connect_stage`` is read by the
+        # gateway when a connect attempt times out so the WARNING can name the stage.
+        self._slash_walk_done: Optional[asyncio.Event] = None
+        self._slash_walk_key: Optional[str] = None
+        self._slash_apply_task: Optional[asyncio.Task] = None
+        self.connect_stage: Optional[str] = None
+        # /skill catalog state; (re)populated by _register_skill_group / _refresh_skill_catalog_state.
+        self._skill_entries: list = []
+        self._skill_lookup: dict = {}
+        self._skill_group_hidden_count = 0
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._username_resolved_ids: set = set()  # IDs resolved from username entries (gateway authz union)
         self._allowed_role_ids: set = set()  # For DISCORD_ALLOWED_ROLES filtering
@@ -1483,6 +1569,13 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             # Close any existing client first: a zombie client also fires on_message -> double responses.
             # Without this, the old client remains connected to Discord gateway and both fire on_message,
             # causing double responses. See #18187.
+            # A new attempt supersedes any deferred slash-command apply from a previous one
+            # (est-pm8sg): it either reuses the now-cached spec or attaches to the walk
+            # already in flight for this profile.
+            if self._slash_apply_task is not None and not self._slash_apply_task.done():
+                self._slash_apply_task.cancel()
+            self._slash_apply_task = None
+            self._slash_walk_done = None
             if self._client is not None:
                 try:
                     if not self._client.is_closed():
@@ -1492,6 +1585,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 finally:
                     self._client = None
                     self._ready_event.clear()
+            self.connect_stage = "creating platform client"
             self._client = commands.Bot(
                 command_prefix="!",  # Not really used, we handle raw messages
                 intents=intents,
@@ -1596,15 +1690,36 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                         ):
                             receiver.refresh_credentials("membership change")
 
-            # Register slash commands
+            # Register slash commands WITHOUT spending the connect budget on disk
+            # (est-pm8sg): the last good catalog spec rebuilds the tree from RAM; a cold
+            # catalog starts one single-flight walk thread and the commands land after
+            # READY via _apply_deferred_slash_commands. Pre-fix this awaited a fresh disk
+            # walk of gates+plugins+skills (#110707) inside the 30s budget: on a starved
+            # disk every reconnect attempt died before login began, and cancelling the
+            # await could not stop the running thread — one orphan walk per attempt
+            # competed for the same starved disk (17:38:01/18:16:52 cluster finishes).
             if self._slash_commands:
-                # Registration walks the skill catalog on disk (#110707); keep the loop free.
-                await asyncio.to_thread(self._register_slash_commands)
+                self.connect_stage = "slash-command registration"
+                tree = self._client.tree
+                spec, stale = _slash_spec_cached()
+                if spec is not None:
+                    self._apply_slash_command_spec(tree, spec)
+                    if stale:
+                        # Serve the stale catalog now; refresh behind this connection.
+                        self._kick_slash_command_walk(waiter=False)
+                else:
+                    done, raced = self._kick_slash_command_walk()
+                    if raced is not None:
+                        self._apply_slash_command_spec(tree, raced)
+                    elif done is not None:
+                        self._slash_walk_done = done
             self._disconnecting = False
+            self.connect_stage = "starting Discord client"
             self._bot_task = asyncio.create_task(self._client.start(self.config.token))
             self._bot_task.add_done_callback(self._handle_bot_task_done)
             ready_timeout = _discord_ready_timeout_seconds()
             # Wait for ready, failing fast if the startup task dies first (e.g. SOCKS errors).
+            self.connect_stage = "waiting for Discord READY"
             await _wait_for_ready_or_bot_exit(
                 self._ready_event, self._bot_task,
                 timeout=None if ready_timeout <= 0 else ready_timeout,
@@ -1615,6 +1730,16 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             self._start_liveness_probe()
             # Plugin-registered native handlers (discord.py Bot — add_listener()/event hooks).
             self._wire_plugin_handlers(self._client)
+            if self._slash_walk_done is not None:
+                # Cold-catalog attempt: READY came first (the connect budget never paid the
+                # disk walk); land the commands on the live tree when the walk finishes
+                # and re-run the same post-connect command sync (est-pm8sg).
+                self._slash_apply_task = asyncio.create_task(
+                    self._apply_deferred_slash_commands(self._slash_walk_done)
+                )
+                self._slash_apply_task.add_done_callback(_consume_background_task_result)
+                self._slash_walk_done = None
+            self.connect_stage = None
             return True
         except TimeoutError:
             logger.error("[%s] Timeout waiting for connection to Discord", self.name, exc_info=True)
@@ -2172,7 +2297,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 await self._client.close()
             except Exception as e:  # pragma: no cover - defensive logging
                 logger.warning("[%s] Error during disconnect: %s", self.name, e, exc_info=True)
-        for task in (self._post_connect_task, self._missed_message_backfill_task):
+        for task in (self._post_connect_task, self._missed_message_backfill_task, self._slash_apply_task):
             if task and not task.done():
                 task.cancel()
                 try:
@@ -2185,6 +2310,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         self._post_connect_task = None
         self._liveness_task = None
         self._missed_message_backfill_task = None
+        self._slash_apply_task = None
+        self._slash_walk_done = None
         self._release_platform_lock()
         logger.info("[%s] Disconnected", self.name)
 
@@ -4568,12 +4695,90 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             # defer() happens inside the handler *after* the auth gate.
             await self._handle_thread_create_slash(interaction, name, message, auto_archive_duration)
 
-    def _register_slash_commands(self) -> None:
-        """Register Discord slash commands on the command tree."""
+    def _register_slash_commands(self, spec: Optional[SlashCommandSpec] = None) -> None:
+        """Register Discord slash commands on the command tree (synchronous walk + apply).
+
+        ``spec`` (est-pm8sg) lets a caller reuse a catalog snapshot; the default builds a
+        fresh one and repopulates the per-profile cache. The disk half is
+        ``_build_slash_command_spec`` (config gates, plugin dirs, skill catalog — the part
+        that starves under IO pressure), the RAM half ``_apply_slash_command_spec``;
+        ``connect()`` uses those directly so its budget never awaits a walk.
+        """
         if not self._client:
             return
-        tree = self._client.tree
+        if spec is None:
+            spec = self._build_slash_command_spec()
+            with _SLASH_SPEC_LOCK:
+                _SLASH_SPECS[_slash_spec_cache_key()] = spec
+        self._apply_slash_command_spec(self._client.tree, spec)
+
+    def _build_slash_command_spec(self) -> SlashCommandSpec:
+        """The disk-touching half of the slash-command catalog: config-gate reads,
+        COMMAND_REGISTRY availability, plugin command entries, skill catalog scan. No
+        discord.py calls — safe on a worker thread, and reusable across adapter instances
+        until the TTL (est-pm8sg)."""
+        registry_entries: list[tuple[str, str, str]] = []
+        plugin_entries: list[tuple[str, str, str]] = []
+        categories: dict = {}
+        uncategorized: list[tuple[str, str, str]] = []
+        skill_hidden = 0
+        try:
+            from hermes_cli.commands import COMMAND_REGISTRY, _is_gateway_available, _resolve_config_gates
+            try:
+                config_overrides = _resolve_config_gates()
+            except Exception as e:
+                logger.warning("Discord command gate resolution failed: %s", e)
+                config_overrides = set()
+            registry_entries = [
+                (cmd_def.name, cmd_def.description, cmd_def.args_hint)
+                for cmd_def in COMMAND_REGISTRY
+                if _is_gateway_available(cmd_def, config_overrides)
+            ]
+        except Exception as e:
+            logger.warning("Discord auto-register from COMMAND_REGISTRY failed: %s", e)
+        # Mirror PluginContext.register_command() commands into the native slash picker.
+        try:
+            from hermes_cli.commands import _iter_plugin_command_entries
+            plugin_entries = list(_iter_plugin_command_entries())
+        except Exception as e:
+            logger.warning("Discord auto-register from plugin commands failed: %s", e)
+        # The reserved set _register_skill_group would have read off the tree at this
+        # point: the natives above plus everything auto-registered — deterministic from
+        # the spec itself, so no tree (and no second disk pass) is needed.
+        reserved = {name for name, _desc, _args, _tpl, _followup in _native_slash_commands()}
+        reserved |= {entry[0].lower()[:32] for entry in (*registry_entries, *plugin_entries)}
+        try:
+            from hermes_cli.commands_platforms import discord_skill_commands_by_category
+            categories, uncategorized, skill_hidden = discord_skill_commands_by_category(
+                reserved_names=reserved,
+            )
+        except Exception as e:
+            logger.warning("Discord /skill catalog scan failed: %s", e)
+        skill_entries: list[tuple[str, str, str]] = list(uncategorized)
+        for cat_skills in categories.values():
+            skill_entries.extend(cat_skills)
+        # Stable alphabetical order so autocomplete is predictable across reconnects
+        # (same contract as _refresh_skill_catalog_state).
+        skill_entries.sort(key=lambda entry: entry[0])
+        return SlashCommandSpec(
+            registry_entries=tuple(registry_entries),
+            plugin_entries=tuple(plugin_entries),
+            skill_entries=tuple(skill_entries),
+            skill_hidden=skill_hidden,
+            built_at=time.monotonic(),
+        )
+
+    def _apply_slash_command_spec(self, tree, spec: SlashCommandSpec) -> None:
+        """The RAM half: build discord.py commands from a (possibly cached) catalog spec
+        and add them to ``tree`` (est-pm8sg). Idempotent — every registration skips names
+        already on the tree — so a pre-start apply and a deferred post-READY apply of the
+        same spec cannot double-register."""
         for name, description, args, template, followup in _native_slash_commands():
+            try:
+                if any(cmd.name == name for cmd in tree.get_commands()):
+                    continue
+            except Exception:
+                pass
             if template is None:
                 self._register_thread_slash(tree, name, description)
                 continue
@@ -4613,26 +4818,16 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 # e.g. name conflict with a subcommand group.
                 pass
         try:
-            from hermes_cli.commands import COMMAND_REGISTRY, _is_gateway_available, _resolve_config_gates
-            try:
-                already_registered = {cmd.name for cmd in tree.get_commands()}
-            except Exception:
-                pass
-            config_overrides = _resolve_config_gates()
-            for cmd_def in COMMAND_REGISTRY:
-                if _is_gateway_available(cmd_def, config_overrides):
-                    _auto_register(cmd_def.name, cmd_def.description, cmd_def.args_hint)
-            logger.debug("Discord auto-registered %d commands from COMMAND_REGISTRY", len(already_registered))
-        except Exception as e:
-            logger.warning("Discord auto-register from COMMAND_REGISTRY failed: %s", e)
+            already_registered = {cmd.name for cmd in tree.get_commands()}
+        except Exception:
+            pass
+        for cmd_name, cmd_desc, cmd_args_hint in spec.registry_entries:
+            _auto_register(cmd_name, cmd_desc, cmd_args_hint)
+        logger.debug("Discord auto-registered %d commands from COMMAND_REGISTRY", len(already_registered))
         # Mirror PluginContext.register_command() commands into the native slash picker.
-        try:
-            from hermes_cli.commands import _iter_plugin_command_entries
-            for plugin_name, plugin_desc, plugin_args_hint in _iter_plugin_command_entries():
-                _auto_register(plugin_name, plugin_desc, plugin_args_hint)
-        except Exception as e:
-            logger.warning("Discord auto-register from plugin commands failed: %s", e)
-        self._register_skill_group(tree)
+        for plugin_name, plugin_desc, plugin_args_hint in spec.plugin_entries:
+            _auto_register(plugin_name, plugin_desc, plugin_args_hint)
+        self._register_skill_group(tree, spec=spec)
         if dropped_over_cap:
             # One over-limit command makes Discord reject the entire sync (error 30032).
             logger.warning(
@@ -4649,6 +4844,111 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             "true", "1", "yes", "on",
         }:
             self._apply_owner_only_visibility(tree)
+
+    def _kick_slash_command_walk(self, *, waiter: bool = True):
+        """Single-flight the catalog walk for this adapter's profile home (est-pm8sg).
+
+        Returns ``(done_event, cached_spec)``: ``cached_spec`` non-None means the cache is
+        already warm — apply it; otherwise ``done_event`` fires (via the event loop) when
+        the in-flight or freshly started walk stores a spec. ``waiter=False`` is the TTL
+        refresh path: it walks even when the cache is warm (stale was already judged by
+        the caller) and nobody awaits the event. At most one walk thread exists per
+        profile at any time, so abandoned reconnect attempts can never pile orphan
+        walkers onto a starved disk.
+        """
+        import contextvars
+        key = _slash_spec_cache_key()
+        loop = asyncio.get_running_loop()
+        done: Optional[asyncio.Event] = None
+        start = False
+        with _SLASH_SPEC_LOCK:
+            cached = _SLASH_SPECS.get(key)
+            if waiter and cached is None:
+                done = asyncio.Event()
+                _SLASH_SPEC_WAITERS.setdefault(key, []).append((loop, done))
+            # A refresh kick (waiter=False) walks despite the warm (stale) cache; a cold
+            # kick defers to whatever spec the cache or an in-flight walk will provide.
+            if key not in _SLASH_SPEC_WALKING and (not waiter or cached is None):
+                _SLASH_SPEC_WALKING.add(key)
+                start = True
+            if not waiter:
+                cached = None
+        if start:
+            self._slash_walk_key = key
+            # contextvars.copy_context().run propagates the owning profile's runtime scope
+            # (home override + secret scope) into the walk — the same context inheritance
+            # asyncio.to_thread gave when the walk was awaited (est-pm8sg).
+            threading.Thread(
+                target=contextvars.copy_context().run,
+                args=(self._run_slash_command_walk, key),
+                name=f"discord-slash-catalog-walk:{os.path.basename(key) or 'home'}",
+                daemon=True,
+            ).start()
+        return done, cached
+
+    def _run_slash_command_walk(self, key: str) -> None:
+        """Worker-thread half of the walk (est-pm8sg): build the spec, publish it, clear
+        the single-flight flag, and wake every attached waiter on its own loop. Never
+        cancelled by an attempt timeout — this thread finishing late is a cached spec, not
+        an orphan competing with its successors."""
+        spec: Optional[SlashCommandSpec] = None
+        try:
+            spec = self._build_slash_command_spec()
+        except Exception as exc:
+            logger.warning("[Discord] Slash-command catalog walk failed: %s", exc, exc_info=True)
+        with _SLASH_SPEC_LOCK:
+            _SLASH_SPEC_WALKING.discard(key)
+            if spec is not None:
+                _SLASH_SPECS[key] = spec
+            waiters = _SLASH_SPEC_WAITERS.pop(key, [])
+        for waiter_loop, waiter_event in waiters:
+            try:
+                waiter_loop.call_soon_threadsafe(_slash_spec_set_event, waiter_event)
+            except RuntimeError:
+                pass  # that attempt's loop is gone; the next connect reads the cache
+
+    async def _apply_deferred_slash_commands(self, done: asyncio.Event) -> None:
+        """Finish slash-command registration deferred off the connect budget (est-pm8sg).
+
+        The attempt reached READY with a cold catalog; when the single-flight walk stores
+        the spec, rebuild the live tree from it and run the same post-connect command sync
+        that ``on_ready`` runs, so Discord actually sees the commands. If this adapter is
+        gone when the walk lands, the spec is still cached — the next attempt applies it
+        before login and never pays disk either."""
+        await done.wait()
+        key = self._slash_walk_key or _slash_spec_cache_key()
+        spec, _stale = _slash_spec_by_key(key)
+        if spec is None:
+            logger.warning(
+                "[%s] Slash-command catalog walk produced no spec; commands land next connect",
+                self.name,
+            )
+            return
+        if self._client is None or self._disconnecting:
+            logger.info(
+                "[%s] Deferred slash-command registration skipped (adapter disconnected); "
+                "spec cached for the next attempt",
+                self.name,
+            )
+            return
+        try:
+            self._apply_slash_command_spec(self._client.tree, spec)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Deferred slash-command registration failed: %s", self.name, exc, exc_info=True,
+            )
+            return
+        logger.info(
+            "[%s] Registered slash commands after READY (catalog walk kept off the connect budget)",
+            self.name,
+        )
+        try:
+            await self._run_post_connect_initialization()
+        except Exception:
+            logger.debug(
+                "[%s] Command sync after deferred slash registration failed; next connect reconciles",
+                self.name, exc_info=True,
+            )
 
     def _apply_owner_only_visibility(self, tree) -> None:
         """Set default_member_permissions=0 on every registered slash command.
@@ -4677,7 +4977,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             applied,
         )
 
-    def _register_skill_group(self, tree) -> None:
+    def _register_skill_group(self, tree, spec: Optional[SlashCommandSpec] = None) -> None:
         """Register one flat ``/skill`` command with autocomplete on ``name``.
         A nested ``/skill <category> <name>`` layout blew Discord's ~8000-byte payload cap and broke
         ``tree.sync()``; autocomplete options are fetched dynamically. Entries live on ``self``.
@@ -4686,7 +4986,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         payload grew linearly with the skill catalog — with the default ~75 skills the payload was ~14 KB
         and ``tree.sync()`` rejected the entire slash-command batch (issues 11321, #10259, #11385, #10261,
         #10214).
-        """
+
+        ``spec`` (est-pm8sg) supplies the catalog entries from the cached command spec; without it the
+        disk is re-scanned (the synchronous walk path and runtime refresh callers)."""
         try:
             existing_names = set()
             try:
@@ -4697,8 +4999,17 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             self._skill_entries: list[tuple[str, str, str]] = []
             self._skill_lookup: dict[str, tuple[str, str]] = {}
             self._skill_group_reserved_names: set[str] = set(existing_names)
-            self._refresh_skill_catalog_state()
+            if spec is None:
+                self._refresh_skill_catalog_state()
+            else:
+                self._skill_entries = list(spec.skill_entries)
+                self._skill_lookup = {name: (desc, cmd_key) for name, desc, cmd_key in spec.skill_entries}
+                self._skill_group_hidden_count = spec.skill_hidden
             if not self._skill_entries:
+                return
+            if "skill" in existing_names:
+                # Idempotent apply (est-pm8sg): a deferred apply after a pre-start one
+                # refreshes the entries autocomplete reads but must not re-add the command.
                 return
 
             async def _autocomplete_name(interaction: discord.Interaction, current: str) -> list:

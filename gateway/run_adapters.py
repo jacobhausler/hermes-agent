@@ -202,10 +202,19 @@ class GatewayAdapterLifecycleMixin:
         timeout = self._platform_connect_timeout_secs(platform, initial=initial)
         if timeout <= 0:
             return await adapter.connect(is_reconnect=is_reconnect)
+        started = time.monotonic()
         task = asyncio.ensure_future(adapter.connect(is_reconnect=is_reconnect))
         if await self._wait_or_detach(task, timeout):
             return bool(await task)
-        raise TimeoutError(f"{platform.value} connect timed out after {timeout:g}s")
+        # Name the elapsed time and the stage the attempt died in (est-pm8sg): when
+        # timeouts were only logged at DEBUG with a budget-sized message, operators saw a
+        # silent ladder climb and nothing about where each attempt stalled.
+        elapsed = time.monotonic() - started
+        stage = getattr(adapter, "connect_stage", None) or "unknown stage"
+        raise TimeoutError(
+            f"{platform.value} connect timed out after {elapsed:.1f}s "
+            f"(budget {timeout:g}s) while {stage}"
+        )
 
     async def _connect_initial_adapter_with_timeout(self, adapter, platform) -> bool:
         """Cold-start connect with replace intent visible ONLY during this await, so a later
@@ -1482,6 +1491,7 @@ class GatewayAdapterLifecycleMixin:
         try:
             while self._running:
                 adapter = None
+                attempt_started = time.monotonic()
                 try:
                     adapter, success = await self._secondary_reconnect_attempt(
                         profile_name, platform, predecessor
@@ -1523,10 +1533,20 @@ class GatewayAdapterLifecycleMixin:
                             hand_over_held_inbound(adapter, predecessor)  # an installed adapter owns its queue
                     if not isinstance(exc, Exception):
                         raise  # CancelledError (and other BaseExceptions) propagate after release
-                    logger.debug(
-                        "Secondary %s reconnect attempt failed (profile: %s)", platform.value,
-                        profile_name, exc_info=True,
-                    )
+                    if isinstance(exc, TimeoutError):
+                        # A timed-out attempt is what the ladder exists to survive, but
+                        # DEBUG hid it: operators saw only "[Discord] Disconnected" for a
+                        # 10-minute climb (est-pm8sg). Name the elapsed time; the bounded
+                        # connector's message names the budget and the stage it died in.
+                        logger.warning(
+                            "Secondary %s reconnect attempt failed after %.1fs (profile: %s): %s",
+                            platform.value, time.monotonic() - attempt_started, profile_name, exc,
+                        )
+                    else:
+                        logger.debug(
+                            "Secondary %s reconnect attempt failed (profile: %s)", platform.value,
+                            profile_name, exc_info=True,
+                        )
                 if not self._running:
                     return
                 attempts += 1
