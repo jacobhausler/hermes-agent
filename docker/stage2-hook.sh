@@ -216,13 +216,21 @@ chown_hermes_tree() {
     if refuse_symlinked_path "recursive chown" "$target"; then
         return 0
     fi
-    chown -R hermes:hermes "$target" 2>/dev/null || \
+    # Offenders-only pass: repair the entries whose ownership is actually
+    # wrong and leave every healthy entry untouched. One read-only
+    # traversal bounds the cost by the tree's metadata, and the repairs by
+    # the offender count — a plain `chown -R hermes:hermes` on top of an
+    # early-exit pre-scan rewrote every inode under the target, so a single
+    # root-dropped file (`docker exec` defaults to uid 0 unless `-u` is
+    # passed) cost minutes-to-hours per boot on multi-million-entry
+    # profiles/ trees on HDD/sshfs-backed data volumes (the restart tax).
+    # Symlinks are skipped entirely — neither link nor referent is ever
+    # chowned through the link (the referent may live outside the target or
+    # be dangling), so bind-mounted host files keep their ownership under
+    # the same contract as issue #19788.
+    find "$target" \( ! -user hermes -o ! -group hermes \) ! -type l \
+        -exec chown hermes:hermes {} + 2>/dev/null || \
         echo "[stage2] Warning: chown $target failed (rootless container?) — continuing"
-}
-
-tree_has_non_hermes_owner() {
-    target="$1"
-    find "$target" \( ! -user hermes -o ! -group hermes \) -print -quit 2>/dev/null | grep -q .
 }
 
 needs_chown=false
@@ -244,11 +252,13 @@ if [ "$needs_chown" = true ]; then
         chown hermes:hermes "$HERMES_HOME" 2>/dev/null || \
             echo "[stage2] Warning: chown $HERMES_HOME failed (rootless container?) — continuing"
     fi
-    # Hermes-owned subdirs: recursive chown is safe here because these are
-    # created and managed exclusively by hermes (see the s6-setuidgid mkdir
-    # -p block below for the canonical list).
+    # Hermes-owned subdirs: the offenders-only pass is safe here because
+    # these are created and managed exclusively by hermes, and it repairs
+    # only the handful of mis-owned entries a recursive chown would
+    # wholesale rewrite (see the s6-setuidgid mkdir -p block below for the
+    # canonical list).
     for sub in cron sessions logs hooks memories skills skins plans workspace home profiles pairing platforms/pairing; do
-        if [ -e "$HERMES_HOME/$sub" ] && tree_has_non_hermes_owner "$HERMES_HOME/$sub"; then
+        if [ -e "$HERMES_HOME/$sub" ]; then
             chown_hermes_tree "$HERMES_HOME/$sub"
         fi
     done
@@ -268,20 +278,23 @@ fi
 # are invoked via `docker exec <container> hermes …` (which defaults
 # to root unless `-u` is passed), and that breaks the cont-init
 # reconciler (02-reconcile-profiles) which runs as hermes and walks
-# the profiles dir. Skip the recursive walk when the tree is already
-# owned correctly so warm boots do not rescan huge profile caches.
+# the profiles dir. The pass is offenders-only (see chown_hermes_tree):
+# the boot traversal stays read-only and only genuinely mis-owned
+# entries are chowned, so an all-healthy tree costs one scan and a
+# dirty one no longer rewrites the whole tree's ownership (restart tax
+# on huge profile caches).
 # Idempotent; skipped on rootless containers where chown would fail.
-if [ -d "$HERMES_HOME/profiles" ] && tree_has_non_hermes_owner "$HERMES_HOME/profiles"; then
+if [ -d "$HERMES_HOME/profiles" ]; then
     chown_hermes_tree "$HERMES_HOME/profiles"
 fi
 
 # Always reset ownership of $HERMES_HOME/cron on every boot for the same
 # docker-exec/root-write reason as profiles/. The cron scheduler state
 # (jobs.json) must stay readable by the unprivileged hermes runtime even
-# after root-context maintenance commands or scheduler writes. Skip the
-# recursive walk when the tree is already owned correctly (same warm-boot
-# gate as profiles/).
-if [ -d "$HERMES_HOME/cron" ] && tree_has_non_hermes_owner "$HERMES_HOME/cron"; then
+# after root-context maintenance commands or scheduler writes. Same
+# offenders-only pass as profiles/ — no whole-tree ownership rewrite on
+# warm boots.
+if [ -d "$HERMES_HOME/cron" ]; then
     chown_hermes_tree "$HERMES_HOME/cron"
 fi
 
@@ -307,14 +320,13 @@ fi
 # silently leaving the approved user unauthorized (#10270). The targeted
 # data-volume chown above only runs when the top-level $HERMES_HOME is
 # mis-owned, so warm boots skip it — this block makes a container restart
-# self-heal. Tiny directory (a handful of small JSON files), so even the
-# ownership pre-scan is negligible; gated for consistency with profiles/
-# and cron/.
-if [ -d "$HERMES_HOME/platforms/pairing" ] && tree_has_non_hermes_owner "$HERMES_HOME/platforms/pairing"; then
+# self-heal. Tiny directory (a handful of small JSON files); the same
+# offenders-only pass as profiles/ and cron/ applies for consistency.
+if [ -d "$HERMES_HOME/platforms/pairing" ]; then
     chown_hermes_tree "$HERMES_HOME/platforms/pairing"
 fi
 # Legacy location (pre-consolidated layout).
-if [ -d "$HERMES_HOME/pairing" ] && tree_has_non_hermes_owner "$HERMES_HOME/pairing"; then
+if [ -d "$HERMES_HOME/pairing" ]; then
     chown_hermes_tree "$HERMES_HOME/pairing"
 fi
 
