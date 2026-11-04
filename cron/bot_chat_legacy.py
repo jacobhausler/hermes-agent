@@ -21,16 +21,27 @@ logger = logging.getLogger(__name__)
 _warned: set[Path] = set()
 
 
-def defer(key: str, job: dict, content: str, home: Path, *, for_failure: bool) -> None:
-    """Park one never-admitted output under its delivery id; a later tick hands it to the owner."""
+def defer(key: str, job: dict, content: str, home: Path, *, for_failure: bool,
+          run_id: str = "", run_at: str = "") -> None:
+    """Park one never-admitted output under its delivery id; a later tick hands it to the owner.
+
+    ``run_id``/``run_at`` are the wake's monotonic freshness marker, frozen here so the drain
+    rebuilds the stamped text byte-identically on every attempt (the door replays an existing
+    admission only for the exact payload it took).
+    """
     import time
     root = get_hermes_home().resolve() / "cron" / "bot_chat_pending"
     make_user_dir(root, parents=True, exist_ok=True, mode=0o700)
     path = root / f"{key}.json"
     if not path.exists():  # an existing record (queued or already transferred) keeps its status
-        atomic_json_write(path, dict(
+        record = dict(
             id=key, status="queued", job={k: job[k] for k in ("id", "name") if k in job}, content=content,
-            home=str(home), for_failure=for_failure, sequence=time.time_ns()), fsync_dir=True, mode=0o600)
+            home=str(home), for_failure=for_failure, sequence=time.time_ns())
+        if run_id:
+            record["run_id"] = run_id
+        if run_at:
+            record["run_at"] = run_at
+        atomic_json_write(path, record, fsync_dir=True, mode=0o600)
 
 
 def _queued(root: Path) -> list[tuple[Path, dict]]:
@@ -87,7 +98,10 @@ def _dispose(path: Path, record: dict) -> bool:
             return False
         try:
             receipt = deliver_to_live_owner(
-                home, owner, bot_chat_message(record.get("job") or {}, record["content"]),
+                home, owner, bot_chat_message(
+                    record.get("job") or {}, record["content"],
+                    run_id=str(record.get("run_id") or ""), run_at=str(record.get("run_at") or ""),
+                    replayed=bool(record.get("run_at"))),
                 delivery_id=record["id"], notification_category="diagnostic" if for_failure else "result")
         except Exception as exc:
             # The door is idempotent per id (a replay returns the existing receipt), so the

@@ -245,3 +245,115 @@ def test_tick_hands_legacy_pending_records_to_the_live_owner_once(tmp_path, monk
     assert 'Cronjob "Digest" output' in admitted[0][1] and "the report" in admitted[0][1]
     assert json.loads((root / f"{queued}.json").read_text())["status"] == "transferred"
     assert json.loads((root / f"{claimed}.json").read_text())["status"] == "claimed"
+
+
+# ── wake freshness marker + truthful unverified detail ───────────────────────
+# The 2026-11 alert-beads class: a wake presented 50 minutes after its snapshot — the
+# admission FIFO digesting serially behind busy turns — was indistinguishable from a live
+# one because the text named only the job. The payload now carries the run's monotonic
+# identity, and an unverifiable hand-off always names its why.
+
+
+def _capture_door(monkeypatch, tmp_path, receipts=None):
+    """Live-owner door recording every admitted message; returns the capture list."""
+    from tools import bot_live_delivery as mailbox
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    captured = []
+
+    def fake_deliver(home, owner, message, *, delivery_id, notification_category="result"):
+        captured.append(message)
+        receipt = {"status": "settled", "message": message, "delivery_id": delivery_id,
+                   "notification_category": notification_category}
+        return dict(receipt, **(receipts or {}))
+
+    monkeypatch.setattr(mailbox, "find_canonical_live_owner", lambda home: {"session_id": "bot"})
+    monkeypatch.setattr(mailbox, "deliver_to_live_owner", fake_deliver)
+    return captured
+
+
+def test_wake_stamps_run_id_and_ledger_wall_time(tmp_path, monkeypatch):
+    """The admitted text carries ``run=<execution id> run_at=<claimed wall time>`` from the
+    durable execution ledger, so the receiver can order it against ``last_run_at`` no matter
+    how late the queue hands it over."""
+    import cron.executions as executions
+
+    captured = _capture_door(monkeypatch, tmp_path)
+    monkeypatch.setattr(executions, "get_execution",
+                        lambda run_id: {"id": run_id, "claimed_at": "2026-11-04T14:25:04+00:00"})
+    job = {"id": "j1", "name": "alert-beads", "execution_id": "e" * 32}
+    assert _deliver_to_bot_chat(job, "reconcile output", "") is None
+    assert f" run={'e' * 32} run_at=2026-11-04T14:25:04+00:00" in captured[0]
+    assert captured[0].startswith('[Cronjob "alert-beads" output run=')
+
+
+def test_transient_run_marker_is_frozen_on_the_job_dict(tmp_path, monkeypatch):
+    """Without a ledger row the first build freezes its instant on the job dict: a retry
+    replays byte-identical text, never a second stamped copy of the same delivery id."""
+    captured = _capture_door(monkeypatch, tmp_path)
+    job = {"id": "j1", "name": "n"}
+    assert _deliver_to_bot_chat(job, "out", "") is None
+    assert _deliver_to_bot_chat(job, "out", "") is None
+    assert len(captured) == 2 and captured[0] == captured[1]
+    assert " run=" in captured[0] and " run_at=" in captured[0]
+
+
+def test_unverified_detail_names_the_exception_class_even_with_no_message(tmp_path, monkeypatch):
+    """A bare ``unverified: `` once told the receiver nothing; the class name always rides."""
+    from tools import bot_live_delivery as mailbox
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(mailbox, "find_canonical_live_owner", lambda home: {"session_id": "bot"})
+    monkeypatch.setattr(mailbox, "deliver_to_live_owner", mock.Mock(side_effect=TimeoutError()))
+    err = _deliver_to_bot_chat({"id": "j1", "name": "n", "execution_id": "r1"}, "out", "")
+    assert err is not None
+    detail = err.split("unverified: ", 1)[1]
+    assert detail.strip() != "" and "TimeoutError" in detail
+
+
+def test_pre_dial_failure_defers_with_a_reason(tmp_path, monkeypatch):
+    """A door that died before its RPC reached the socket admitted nothing: the output is a
+    definite no-send, so it parks on the durable defer lane (retried by a later tick) with a
+    named reason instead of a dead-end ``delivery_failed``."""
+    import json
+
+    from tools.bot_live_delivery import PreDialError
+    from tools import bot_live_delivery as mailbox
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(mailbox, "find_canonical_live_owner", lambda home: {"session_id": "bot"})
+    monkeypatch.setattr(mailbox, "deliver_to_live_owner", mock.Mock(side_effect=PreDialError("")))
+    job = {"id": "j1", "name": "n", "execution_id": "r1"}
+    err = _deliver_to_bot_chat(job, "out", "")
+    assert err is not None and "queued" in err and "PreDialError" in err
+    assert job["_bot_chat_delivery_receipts"]["bot-chat:(own)"]["status"] == "queued"
+    pending = list((tmp_path / "cron" / "bot_chat_pending").glob("*.json"))
+    assert len(pending) == 1
+    record = json.loads(pending[0].read_text())
+    assert record["status"] == "queued" and record["run_id"] == "r1" and record["run_at"]
+
+
+def test_deferred_record_drains_stamped_and_labelled(tmp_path, monkeypatch):
+    """A parked record replays the frozen marker and says in words that it is a replay — the
+    receiver is never left to infer staleness from arrival order."""
+    from cron.bot_chat_legacy import defer, drain_legacy_pending
+    from tools import bot_live_delivery as mailbox
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "state.db").write_text("")
+    key = "c" * 64
+    defer(key, {"id": "j1", "name": "alert-beads"}, "old snapshot", tmp_path,
+          for_failure=False, run_id="r1", run_at="2026-11-04T14:25:04+00:00")
+    admitted = []
+
+    def fake_deliver(home, owner, message, *, delivery_id, notification_category="result"):
+        admitted.append(message)
+        return {"status": "queued", "message": message, "delivery_id": delivery_id,
+                "notification_category": notification_category}
+
+    monkeypatch.setattr(mailbox, "find_canonical_live_owner", lambda home: {"session_id": "bot"})
+    monkeypatch.setattr(mailbox, "deliver_to_live_owner", fake_deliver)
+    drain_legacy_pending()
+    assert admitted and admitted[0].startswith(
+        "[replayed wake — snapshot 2026-11-04T14:25:04+00:00] ")
+    assert " run=r1 run_at=2026-11-04T14:25:04+00:00" in admitted[0]

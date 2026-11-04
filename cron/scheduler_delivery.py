@@ -694,21 +694,49 @@ def _get_standalone_send_timeout() -> int:
         return 60
 
 
-def bot_chat_message(job: dict, content: str) -> str:
+def bot_chat_message(job: dict, content: str, *, run_id: str = "", run_at: str = "",
+                     replayed: bool = False) -> str:
     """The inbound Bot Chat turn text for one cron output.
 
     Outward lane: this text becomes an inbound turn in another profile's Bot Chat through the
     live owner's durable admission record, so it gets the same fail-closed scrub as the chat
     message and the session mirror; the admitted record carries the scrubbed copy, never the raw
     output.
+
+    A wake can surface long after the snapshot it describes — the target's admission FIFO
+    digests serially behind busy turns, ``cron.bot_chat_legacy`` replays records parked while
+    the authority was down, and ``catch_up`` re-orders whole ticks — so presentation order
+    cannot say which text is current. The payload therefore carries its own monotonic identity:
+    the durable execution id plus the run's claimed wall time (``run=``/``run_at=``). Compare
+    ``run_at`` against the job's ``last_run_at`` to tell a stale wake from a live one; a replayed
+    deferred record says so in words (``replayed``). Every field is frozen where the text is
+    first built, so an idempotent retry or a later drain rebuilds identical bytes (the door
+    rejects any other payload under the same delivery id).
     """
     content = _redact_cron_payload(content, "bot-chat payload")
     job_name = _redact_cron_payload(job.get("name", job.get("id", "?")), "job name")
+    stamp = f" run={run_id}" + (f" run_at={run_at}" if run_at else "") if run_id else ""
+    prefix = f"[replayed wake — snapshot {run_at}] " if replayed and run_at else ""
     return (
-        f'[Cronjob "{job_name}" output — '
+        f'{prefix}[Cronjob "{job_name}" output{stamp} — '
         f"scheduled job, not the user. Review it, act on anything that needs action, and "
         f"summarize for the chat.]\n\n{content}"
     )
+
+
+def _execution_claim_wall_time(run_id: str) -> str:
+    """The run's wall-clock claim time from the durable execution ledger, '' if unresolvable.
+
+    ``claimed_at`` is written once by ``cron.executions.create_execution`` and never rewritten,
+    so every rebuild of a wake for this run — retry, deferred replay, another process — stamps
+    the identical instant.
+    """
+    try:
+        from cron.executions import get_execution
+        record = get_execution(run_id) or {}
+    except Exception:
+        return ""
+    return str(record.get("claimed_at") or record.get("started_at") or "")
 
 
 def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
@@ -727,13 +755,14 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
     import uuid
     from hermes_constants import get_hermes_home
     from hermes_cli.profiles import get_profile_dir
+    from hermes_time import now as _hermes_now
     from tools.bot_live_delivery import (
-        deliver_to_live_owner, find_canonical_live_owner, read_delivery_result,
+        PreDialError, deliver_to_live_owner, find_canonical_live_owner, read_delivery_result,
     )
 
     job_id = job.get("id", "?")
     profile_label = profile or "(own)"
-    message = bot_chat_message(job, content)
+    target = f"bot-chat:{profile_label}"
     try:
         source_home = get_hermes_home().resolve()
         home = (get_profile_dir(profile) if profile else source_home).resolve()
@@ -747,13 +776,19 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
         run_id = job.get("execution_id")
         if not run_id:
             run_id = job.setdefault("_bot_chat_run_id", uuid.uuid4().hex)
+        # The wake's freshness marker: the run's claimed wall time, immutable in the ledger,
+        # so every build of this run's text stamps the same instant. A transient run with no
+        # ledger row freezes its first-build time on the job dict for the same reason.
+        run_at = job.get("_bot_chat_run_at") or _execution_claim_wall_time(str(run_id))
+        if not run_at:
+            run_at = job.setdefault("_bot_chat_run_at", _hermes_now().isoformat())
+        message = bot_chat_message(job, content, run_id=str(run_id), run_at=run_at)
         key = hashlib.sha256(json.dumps(
             [str(source_home), job_id, str(run_id), str(home)],
             ensure_ascii=False, separators=(",", ":"),
         ).encode("utf-8")).hexdigest()
         # Read BEFORE discovery: the previous owner may have exited after accepting.
         receipt = read_delivery_result(home, key)
-        target = f"bot-chat:{profile_label}"
         if receipt is None and suppress_notification:
             # Suppression is a durable disposition, not a send: the failure notice is booked
             # against the job and never handed to the owner (the target profile hides
@@ -767,14 +802,29 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
                 owner = find_canonical_live_owner(home)
             except ValueError:  # the target's gateway is down or starting: not a disposition
                 from cron.bot_chat_legacy import defer
-                defer(key, job, content, home, for_failure=for_failure)
+                defer(key, job, content, home, for_failure=for_failure,
+                      run_id=str(run_id), run_at=run_at)
                 job.setdefault("_bot_chat_delivery_receipts", {})[target] = {"status": "queued", "delivery_id": key}
                 return f"{target} queued (receipt {key}): target profile not running; admitted once it is"
             if owner is None:
                 return f"bot-chat delivery to profile '{profile_label}' unverified: no canonical Bot Chat"
             # A failure notice rides as ``diagnostic`` so the target's reply stays muted.
-            receipt = deliver_to_live_owner(home, owner, message, delivery_id=key,
-                **({"notification_category": "diagnostic"} if for_failure else {}))
+            try:
+                receipt = deliver_to_live_owner(home, owner, message, delivery_id=key,
+                    **({"notification_category": "diagnostic"} if for_failure else {}))
+            except PreDialError as exc:
+                # The door died before its RPC reached the socket: nothing was admitted, so
+                # this is a definite no-send (``tools.bot_live_delivery.PreDialError``), not an
+                # unknown outcome. Park it on the same durable defer lane as an unreachable
+                # authority — a later tick admits it — instead of dropping the output on an
+                # opaque ``delivery_failed`` (an empty str(exc) here once recorded the whole
+                # failure as a bare trailing colon).
+                from cron.bot_chat_legacy import defer
+                defer(key, job, content, home, for_failure=for_failure,
+                      run_id=str(run_id), run_at=run_at)
+                job.setdefault("_bot_chat_delivery_receipts", {})[target] = {"status": "queued", "delivery_id": key}
+                return (f"{target} queued (receipt {key}): pre-dial failure "
+                        f"({type(exc).__name__}: {exc or 'no details'}); admitted once it is")
         if (receipt["message"] != message
                 or receipt.get("notification_category", "result") != ("diagnostic" if for_failure else "result")):
             raise ValueError("delivery id already belongs to a different payload")
@@ -789,7 +839,10 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
                   else receipt.get("error") or receipt.get("reason") or "not completed")
         return f"{target} {status} (receipt {key}): {detail}"
     except Exception as exc:
-        return f"bot-chat delivery to profile '{profile_label}' unverified: {exc}"
+        # The class name rides even when the exception has no message: a bare
+        # ``unverified: `` after the colon left the job record with nothing to act on.
+        return (f"bot-chat delivery to profile '{profile_label}' unverified: "
+                f"{type(exc).__name__}: {exc or 'no details'}")
 
 
 def _normalize_deliver_value(deliver) -> str:
