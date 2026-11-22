@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "identity": "0000000000000000000000000000000000000000",
+  "bootstrappedAt": "2026-10-03T11:46:38+0000",
+  "results": {
+    "adopt_blessed_checkout": {
+      "ok": true,
+      "skipped": "not-a-checkout"
+    },
+    "migrate_config": {
+      "ok": true,
+      "skipped": "up-to-date"
+    },
+    "state_db_guard": {
+      "ok": true,
+      "skipped": "no-state-db"
+    },
+    "drop_live_plugin_catalog": {
+      "ok": true
+    },
+    "expose_cli": {
+      "ok": true,
+      "skipped": "externally-owned"
+    }
+  }
+}
