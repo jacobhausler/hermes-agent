@@ -19,8 +19,8 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import os
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -54,7 +54,7 @@ class CheckResult:
     latest: Optional[str] = None
     update_available: Optional[bool] = None   # None = unknown/uncheckable
     needs_fixing: Optional[str] = None        # mismatch reason when set
-    min_hermes: Optional[str] = None          # feed's version floor, if any
+    min_hermes: Optional[str] = None          # feed floor / catalog requires_hermes, if any
     reason: str = ""
 
     def to_json(self) -> dict:
@@ -88,6 +88,15 @@ def _read_manifest_field(plugin_dir: Path, key: str) -> Optional[str]:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def _self_cloned_next_step(path: Path) -> str:
+    from pm.filesystem import is_junction
+
+    if path.is_symlink() or is_junction(path):
+        # `adopt` refuses a link on purpose: Hermes never updates or deletes files outside its plugins dir.
+        return f"linked to {os.path.realpath(path)}; pull updates in that checkout"
+    return "self-cloned; run `hermes plugins adopt` first"
+
+
 def check_local_provenance(prov: Provenance) -> CheckResult:
     """Check installed provenance without fetching remote metadata."""
     result = CheckResult(name=prov.name, klass=prov.klass.value)
@@ -113,7 +122,7 @@ def check_local_provenance(prov: Provenance) -> CheckResult:
         )
         return result
     if prov.klass is ProvenanceClass.SELF_CLONED:
-        result.reason = "self-cloned; run `hermes plugins adopt` first"
+        result.reason = _self_cloned_next_step(prov.path)
         return result
 
     row = prov.row or {}
@@ -206,6 +215,18 @@ def _artifact_vs_catalog(
     return result
 
 
+def held_for_newer_hermes(result: CheckResult) -> Optional[str]:
+    """``needs Hermes <spec>; this is <version>`` when the update's ``min_hermes`` (a feed floor or the
+    catalog entry's ``requires_hermes``) rejects the running Hermes, else ``None``. The update path refuses
+    such an update, so listings name it as waiting on a Hermes update instead of offering it."""
+    if not result.min_hermes:
+        return None
+    from hermes_cli.plugins_manifest import requires_hermes_error, running_hermes_version
+    if not requires_hermes_error({"requires_hermes": result.min_hermes}):
+        return None
+    return f"needs Hermes {result.min_hermes}; this is {running_hermes_version()}"
+
+
 def check_provenanced(
     prov: Provenance,
     *,
@@ -250,6 +271,7 @@ def check_provenanced(
             return _artifact_vs_catalog(result, prov, entry)
         result.latest = entry.sha
         result.update_available = result.current != entry.sha
+        result.min_hermes = entry.requires_hermes or None
         return result
     result = check_local_provenance(prov)
     if result.reason or result.needs_fixing:
@@ -480,15 +502,13 @@ def default_ls_remote(source: str) -> str:
     imports plugins_cmd (which lazily imports this module) — no import
     cycle at module load.
     """
-    from hermes_cli.plugins_cmd import _resolve_git_executable
+    from hermes_cli.plugins_cmd import _resolve_git_executable, _run_plugin_git
 
-    proc = subprocess.run(
-        [_resolve_git_executable() or "git", "ls-remote", source, "HEAD"],
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-        timeout=30,
-        check=False,
-    )
+    # Through the plugin git runner, like clone and pull: no terminal and no ambient credential
+    # helper (PM's PortableGit names a GUI chooser there, which outlives the timeout below), and a
+    # stored credential only when the remote asks for one.
+    proc = _run_plugin_git(_resolve_git_executable() or "git", Path.cwd(), "ls-remote", source, "HEAD",
+                           timeout=30, auth_url=source)
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or "ls-remote failed").strip()[:200])
     # 'sha\trefs/heads/...' or empty
