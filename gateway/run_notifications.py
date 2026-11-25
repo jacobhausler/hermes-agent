@@ -899,8 +899,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         Not transactional: a crash after acceptance can replay (at-least-once).
         """
         from gateway.session_detached import follow_detached_pin
+        from gateway.process_notification_policy import drop_process_notification
         from gateway.session_local_recovery import restore_completion_route
         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
+        if await drop_process_notification(self, evt):
+            return None  # terminal suppression: no admission and no producer retry
         restore_completion_route(self, str(evt.get("session_key") or ""))  # watch notices and heartbeats too
         queued, evt = evt, await follow_detached_pin(self, evt)  # the drain reads its verdict off *queued*
         source = await asyncio.to_thread(self._build_process_event_source, evt)
