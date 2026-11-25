@@ -143,6 +143,8 @@ VALID_HOOKS: set[str] = {
     # auth/pairing and dispatch. Kwargs: event, gateway, session_store. Return {"action": "skip",
     # "reason"} -> drop; {"action": "rewrite", "text"} -> replace event.text; "allow"/None -> normal.
     "pre_gateway_dispatch", "post_gateway_admission",  # post_*: fail-open consume, gateway/run_inbound_consumer.py
+    # pre_process_notification: may drop a pinned terminal notification before it admits a turn.
+    "pre_process_notification",
     # agent_loop_stopped: an agent turn was interrupted mid-run (/stop, or the running-agent
     # fast-path of /new; see gateway/run.py::_interrupt_and_clear_session). Kwargs: session_key,
     # platform, reason, invalidation_reason. Return values are ignored.
