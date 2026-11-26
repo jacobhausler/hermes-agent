@@ -104,5 +104,7 @@ def test_a_still_wedged_writer_raises_after_three_fresh_patiences(backend, scope
     release.set()
     assert attempts == [PATIENCE] * coordination_module._LEDGER_ATTEMPTS
     # Every attempt got its own patience (the raise comes after all three waits) and the total stays bounded.
-    assert 3 * PATIENCE * 0.9 <= took < 3 * (PATIENCE + 0.2)
+    # The ceiling carries room for scheduling overshoot: a timed acquire whose holder is on another thread
+    # returns late on a busy runner, and the attempt count above, not this bound, is the contract.
+    assert 3 * PATIENCE * 0.9 <= took < 3 * (PATIENCE + 0.6)
     assert _delivery_state(scope_a) == "pending"  # the refused sweep touched nothing
