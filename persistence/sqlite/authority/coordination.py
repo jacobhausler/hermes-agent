@@ -20,7 +20,7 @@ from persistence import (
     AuthorityRefusal, DelegationId, JsonValue, PersistenceError, SessionId, StoreContention, StoreReplaced,
 )
 from persistence.core.errors import HandoffUnsettled
-from persistence.sqlite._state.write import write_site, writer_mutex_until
+from persistence.sqlite._state.write import WriterMutexTimeout, write_site, writer_mutex_until
 from persistence.authority.coordination import (
     COMPLETION_DELIVERIES, DELEGATION_CLAIM_STALE_SECONDS, DELEGATION_FAILURE_WINDOW_SECONDS,
     DELEGATION_MAX_DELIVERY_ATTEMPTS, DELEGATION_MAX_DURABLE_PENDING, DELEGATION_MAX_RETAINED_TERMINAL,
@@ -39,6 +39,13 @@ from ..gateway._delivery_ledger import LEDGER_PATIENCE_S, DeliveryObligationVerb
 from .subagents import KEEP_WAITING_UNITS_SQL, SubagentLedgerVerbs, recover_subagents
 
 __all__ = ["SQLiteCoordinationRepository"]
+
+# A ledger write's attempts at the store's writer mutex. In-process writer starvation is transient:
+# a queue of transcript commits can drain slower than the ledgers' patience (the system's smallest),
+# and ``WriterMutexTimeout`` is raised before ``BEGIN IMMEDIATE`` — the callback never ran, so the
+# re-race is exactly-once safe. Like ``_ledger_setup``, a verb re-races a bounded number of times,
+# each attempt with a fresh patience; a writer that never yields still ends in ``StoreContention``.
+_LEDGER_ATTEMPTS = 3
 
 # The log records keep main's logger names: the store's and the delegation tool's.
 logger = logging.getLogger("hermes_state")
@@ -140,8 +147,21 @@ class SQLiteCoordinationRepository(DeliveryObligationVerbs, SubagentLedgerVerbs)
         self._store = store
 
     def _ledger_write(self, fn):
-        """One ledger transaction on the store's writer (BEGIN IMMEDIATE) with the ledgers' lock wait."""
-        return self._store.holder()._execute_write(fn, patience_s=LEDGER_PATIENCE_S)
+        """One ledger transaction on the store's writer (BEGIN IMMEDIATE) with the ledgers' lock wait.
+
+        A starved acquire of the in-process writer mutex (``WriterMutexTimeout``, raised before the
+        transaction begins) is transient, so the verb re-races it ``_LEDGER_ATTEMPTS`` times with the
+        store's own jitter, each attempt holding a fresh patience. Caught here, it reaches the
+        callers' ``translated()`` only once the attempts are spent."""
+        holder = self._store.holder()
+        for _ in range(_LEDGER_ATTEMPTS - 1):
+            try:
+                return holder._execute_write(fn, patience_s=LEDGER_PATIENCE_S)
+            except WriterMutexTimeout:
+                if not holder._sleep_before_write_retry(time.monotonic() + LEDGER_PATIENCE_S,
+                                                        LEDGER_PATIENCE_S):
+                    raise
+        return holder._execute_write(fn, patience_s=LEDGER_PATIENCE_S)
 
     def _ledger_read(self, read):
         """``read(conn)`` on a read connection with the ledgers' lock wait."""
