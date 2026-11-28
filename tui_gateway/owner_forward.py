@@ -137,7 +137,12 @@ class _Relay:
 
     async def _run(self) -> None:
         async with connect_owner(self.home, self.endpoint) as client:
-            attached = await client.rpc("session.resume", session_id=self.key)
+            # Only the attach and the submit need this answer: the owner's full-history snapshot is
+            # one frame over the relay's cap on a long chat (3 MB observed), the socket dies before
+            # the prompt is admitted, and the Desktop gets SESSION_OWNER_BUSY on a transient refusal
+            # that never recovers. A lean resume also keeps the answer bounded by the queue, not the
+            # transcript.
+            attached = await client.rpc("session.resume", session_id=self.key, omit_messages=True)
             target = str(attached.get("session_id") or self.key)
             receipt = await self._submit(client, target)
             if receipt.get("voice_stopped") is True:
